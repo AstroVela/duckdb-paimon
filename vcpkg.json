@@ -3,7 +3,7 @@
                 "curl",
                 "openssl"
         ],
-        "builtin-baseline": "44819aa2a6c10e56065e2b0330e7d6c89d1d2574",
+        "builtin-baseline": "84bab45d415d22042bd0b9081aea57f362da3f35",
         "vcpkg-configuration": {
                 "overlay-ports": [
                         "./extension-ci-tools/vcpkg_ports"
