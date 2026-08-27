@@ -9,3 +9,6 @@
 [submodule "third_party/paimon-cpp"]
 	path = third_party/paimon-cpp
 	url = https://github.com/apache/paimon-cpp
+[submodule "vane-extension-ci-tools"]
+	path = vane-extension-ci-tools
+	url = https://github.com/AstroVela/vane-extension-ci-tools.git
