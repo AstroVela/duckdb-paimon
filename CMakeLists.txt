@@ -12,6 +12,15 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 
+option(PAIMON_VANE_DISTRIBUTED
+       "Build the explicit Vane distributed Paimon interfaces" OFF)
+if(PAIMON_VANE_DISTRIBUTED)
+  if(NOT EXISTS "${DUCKDB_SOURCE_PATH}/src/include/duckdb/function/distributed_table_function.hpp")
+    message(FATAL_ERROR "PAIMON_VANE_DISTRIBUTED requires the Vane DuckDB source tree")
+  endif()
+  add_definitions(-DPAIMON_VANE_DISTRIBUTED)
+endif()
+
 # Import paimon-cpp as a subproject
 include(ExternalProject)
 
@@ -34,6 +43,19 @@ set(PAIMON_CPP_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/paimon-cpp-install)
 set(PAIMON_CPP_INCLUDE ${PAIMON_CPP_PREFIX}/include)
 set(PAIMON_CPP_LIB ${PAIMON_CPP_PREFIX}/lib64)
 file(MAKE_DIRECTORY ${PAIMON_CPP_INCLUDE})
+
+# paimon-cpp's bundled AWS projects install package metadata below lib64 while
+# the downstream projects discover packages below lib. Keep this build-tree
+# alias isolated to Vane; the native DuckDB build retains its existing layout.
+if(PAIMON_VANE_DISTRIBUTED AND UNIX AND NOT APPLE)
+  set(PAIMON_VANE_AWS_PREFIX
+      "${CMAKE_CURRENT_BINARY_DIR}/paimon_cpp_ep-prefix/src/paimon_cpp_ep-build/aws-auth_ep-install")
+  file(MAKE_DIRECTORY "${PAIMON_VANE_AWS_PREFIX}/lib64")
+  if(NOT EXISTS "${PAIMON_VANE_AWS_PREFIX}/lib" AND
+     NOT IS_SYMLINK "${PAIMON_VANE_AWS_PREFIX}/lib")
+    file(CREATE_LINK lib64 "${PAIMON_VANE_AWS_PREFIX}/lib" SYMBOLIC)
+  endif()
+endif()
 
 set(PAIMON_CPP_PATCHES
   ${CMAKE_CURRENT_SOURCE_DIR}/patches/paimon-cpp-install-arrow-headers.patch)
@@ -177,6 +199,61 @@ set(PAIMON_CPP_RUNTIME_BUNDLE_LIBS
   ${PAIMON_CPP_LIB}/libpaimon_avro_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
   ${PAIMON_CPP_LIB}/libpaimon_blob_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
 )
+
+# A Vane wheel embeds DuckDB and its extensions in vane._native. Install the
+# Paimon runtime DSOs beside that module and resolve them relative to the wheel
+# instead of retaining a build-tree RUNPATH. Native DuckDB packaging continues
+# to use the existing loadable-extension bundle below.
+if(PAIMON_VANE_DISTRIBUTED AND DEFINED SKBUILD_PLATLIB_DIR AND UNIX AND
+   NOT APPLE)
+  set(PAIMON_VANE_WHEEL_RUNTIME_LIBS
+    ${PAIMON_CPP_LIB}/libpaimon${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/libpaimon_file_index${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/libpaimon_global_index${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/libpaimon_local_file_system${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/libpaimon_jindo_file_system${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/libpaimon_s3_file_system${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/libpaimon_parquet_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/libpaimon_orc_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/libpaimon_avro_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/libpaimon_blob_file_format${CMAKE_SHARED_LIBRARY_SUFFIX})
+
+  # Vane adds DuckDB with EXCLUDE_FROM_ALL, so install rules declared in this
+  # extension directory are not reached by scikit-build-core. Defer the wheel
+  # rules into Vane's top-level directory, after its _native target exists.
+  set(PAIMON_VANE_WHEEL_RUNTIME_LIBS
+      "${PAIMON_VANE_WHEEL_RUNTIME_LIBS}"
+      CACHE INTERNAL "Paimon runtime libraries bundled in a Vane wheel" FORCE)
+  set(PAIMON_VANE_WHEEL_JINDO_SOURCE
+      "${PAIMON_CPP_LIB}/libjindosdk_c.so.${_jindosdk_ver}"
+      CACHE INTERNAL "JindoSDK library bundled in a Vane wheel" FORCE)
+  set(PAIMON_VANE_WHEEL_JINDO_NAME
+      "${JINDOSDK_C_RUNTIME_NAME}"
+      CACHE INTERNAL "JindoSDK runtime name used in a Vane wheel" FORCE)
+  set(PAIMON_VANE_WHEEL_LICENSE_ROOT
+      "${PAIMON_CPP_SOURCE_DIR}"
+      CACHE INTERNAL "Paimon license source bundled in a Vane wheel" FORCE)
+
+  cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL set_property
+                 TARGET _native PROPERTY INSTALL_RPATH "\$ORIGIN")
+  cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL install FILES
+                 ${PAIMON_VANE_WHEEL_RUNTIME_LIBS} DESTINATION vane)
+  cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL install FILES
+                 ${PAIMON_VANE_WHEEL_JINDO_SOURCE} DESTINATION vane RENAME
+                 ${PAIMON_VANE_WHEEL_JINDO_NAME})
+  cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL install FILES
+                 ${PAIMON_VANE_WHEEL_LICENSE_ROOT}/LICENSE
+                 ${PAIMON_VANE_WHEEL_LICENSE_ROOT}/NOTICE DESTINATION
+                 vane/licenses/paimon-cpp)
+  cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL install DIRECTORY
+                 ${PAIMON_VANE_WHEEL_LICENSE_ROOT}/licenses/ DESTINATION
+                 vane/licenses/paimon-cpp/third-party)
+  cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL install FILES
+                 ${PAIMON_VANE_WHEEL_LICENSE_ROOT}/third_party/jindosdk-nextarch/LICENSE.txt
+                 ${PAIMON_VANE_WHEEL_LICENSE_ROOT}/third_party/jindosdk-nextarch/NOTICE.txt
+                 DESTINATION vane/licenses/paimon-cpp/jindosdk-nextarch)
+endif()
+
 foreach(lib IN LISTS PAIMON_CPP_RUNTIME_BUNDLE_LIBS)
   add_custom_command(
     TARGET ${TARGET_NAME}_loadable_extension

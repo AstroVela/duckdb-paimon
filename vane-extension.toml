@@ -1,0 +1,9 @@
+schema_version = 1
+name = "paimon"
+extension_config = "extension_config_vane.cmake"
+build_extensions = ["httpfs", "parquet"]
+native_test_selection = "test/sql/paimon_scan.test"
+
+[vane]
+repository = "AstroVela/vane"
+revision = "3a85ec3c18ccc0af5d2e0f0183bc851d6443a411"

@@ -253,6 +253,27 @@ Or build in debug mode:
 GEN=ninja make debug
 ```
 
+### Optional Vane Build
+
+The default targets continue to build against the upstream `duckdb/`
+submodule. Vane integration is selected explicitly and does not replace the
+native DuckDB extension build.
+
+`vane-extension-ci-tools/` checks out the exact Vane revision pinned in
+`vane-extension.toml`, builds this extension against Vane's
+`external/duckdb`, and enables `PAIMON_VANE_DISTRIBUTED` through the separate
+`extension_config_vane.cmake` configuration. Vane-only headers and code are
+excluded from the default build.
+
+```shell
+make vane_validate
+make vane_ci VANE_BUILD_JOBS=8
+make vane_wheel VANE_BUILD_JOBS=8
+```
+
+The initial Vane lane validates the isolated build and the existing native
+Paimon scan path. Distributed scan and write behavior is added separately.
+
 ### Running the Tests
 
 ```shell

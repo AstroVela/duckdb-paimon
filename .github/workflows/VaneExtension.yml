@@ -1,0 +1,22 @@
+name: Vane extension
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  vane-extension:
+    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@28c253d71645b627e90307a8c0f42bf74bda0046
+    with:
+      ci_tools_version: 28c253d71645b627e90307a8c0f42bf74bda0046
+      manifest: vane-extension.toml
+      build_jobs: 12
+      run_native_tests: true
