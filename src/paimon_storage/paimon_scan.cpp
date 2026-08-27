@@ -37,6 +37,9 @@
 
 #include "paimon_catalog.hpp"
 #include "paimon_functions.hpp"
+#ifdef PAIMON_VANE_DISTRIBUTED
+#include "paimon_scan.hpp"
+#endif
 #include "paimon_type_utils.hpp"
 
 #include "paimon/api.h"
@@ -49,6 +52,7 @@
 
 namespace duckdb {
 
+#ifndef PAIMON_VANE_DISTRIBUTED
 struct PaimonScanBindData : public TableFunctionData {
 public:
 	PaimonTablePath path;
@@ -68,6 +72,7 @@ public:
 
 	string table_schema_json;
 };
+#endif
 
 static std::shared_ptr<paimon::Predicate> TryConvertComparison(const BoundComparisonExpression &comp,
                                                                const LogicalGet &get) {
@@ -643,6 +648,10 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 	if (data_schema) {
 		auto &part_keys = data_schema->PartitionKeys();
 		bind_data->part_keys.assign(part_keys.begin(), part_keys.end());
+#ifdef PAIMON_VANE_DISTRIBUTED
+		bind_data->distributed.schema_id = data_schema->Id();
+		bind_data->distributed.append_only = data_schema->PrimaryKeys().empty();
+#endif
 	}
 
 	auto json_schema_result = table_schema->GetJsonSchema();
@@ -668,6 +677,11 @@ static unique_ptr<FunctionData> PaimonScanBind(ClientContext &context, TableFunc
 	return_types = arrow_table.GetTypes();
 
 	bind_data->arrow_table = std::move(arrow_table);
+#ifdef PAIMON_VANE_DISTRIBUTED
+	bind_data->distributed.return_types = return_types;
+	bind_data->distributed.return_names = names;
+	InitializePaimonDistributedScanBind(*bind_data);
+#endif
 
 	if (arrow_schema && arrow_schema->release) {
 		arrow_schema->release(arrow_schema.get());
@@ -682,12 +696,50 @@ struct PaimonScanGlobalState : public GlobalTableFunctionState {
 	string path;
 	ArrowTableSchema arrow_table;
 	std::shared_ptr<paimon::Predicate> paimon_predicates = nullptr;
+#ifdef PAIMON_VANE_DISTRIBUTED
+	bool distributed_worker = false;
+#endif
 
 	idx_t MaxThreads() const override {
 		return splits.size();
 	}
 };
 
+#ifdef PAIMON_VANE_DISTRIBUTED
+static std::shared_ptr<paimon::Plan> CreatePaimonScanPlan(const PaimonScanBindData &bind) {
+	paimon::ScanContextBuilder scan_context_builder(bind.table_data_path);
+	scan_context_builder.SetOptions(bind.paimon_options).SetPredicate(bind.predicates);
+	if (!bind.part_filters.empty()) {
+		scan_context_builder.SetPartitionFilter(bind.part_filters);
+	}
+
+	auto scan_context_result = scan_context_builder.Finish();
+	if (!scan_context_result.ok()) {
+		throw IOException(scan_context_result.status().ToString());
+	}
+	auto scan_context = std::move(scan_context_result).value();
+
+	auto scanner_result = paimon::TableScan::Create(std::move(scan_context));
+	if (!scanner_result.ok()) {
+		throw IOException(scanner_result.status().ToString());
+	}
+	auto scanner = std::move(scanner_result).value();
+
+	auto plan_result = scanner->CreatePlan();
+	if (!plan_result.ok()) {
+		throw IOException(plan_result.status().ToString());
+	}
+	return std::move(plan_result).value();
+}
+
+static std::vector<std::shared_ptr<paimon::Split>> CreatePaimonScanSplits(const PaimonScanBindData &bind) {
+	return CreatePaimonScanPlan(bind)->Splits();
+}
+
+std::shared_ptr<paimon::Plan> PaimonCreateDistributedScanPlan(const PaimonScanBindData &bind) {
+	return CreatePaimonScanPlan(bind);
+}
+#else
 static std::vector<std::shared_ptr<paimon::Split>> CreatePaimonScanSplits(const PaimonScanBindData &bind) {
 	paimon::ScanContextBuilder scan_context_builder(bind.table_data_path);
 	scan_context_builder.SetOptions(bind.paimon_options).SetPredicate(bind.predicates);
@@ -715,6 +767,7 @@ static std::vector<std::shared_ptr<paimon::Split>> CreatePaimonScanSplits(const 
 
 	return plan->Splits();
 }
+#endif
 
 struct PaimonScanLocalState : public LocalTableFunctionState {
 public:
@@ -725,7 +778,16 @@ public:
 	                     vector<column_t> column_ids)
 	    : global_state(gstate), bind_data(bind_data) {
 		read_column_ids.reserve(column_ids.size());
+#ifdef PAIMON_VANE_DISTRIBUTED
+		idx_t column_count;
+		if (bind_data.distributed.phase == PaimonDistributedScanPhase::WORKER_ASSIGNED) {
+			column_count = bind_data.distributed.return_types.size();
+		} else {
+			column_count = bind_data.arrow_table.GetColumns().size();
+		}
+#else
 		auto column_count = bind_data.arrow_table.GetColumns().size();
+#endif
 		for (auto column_id : column_ids) {
 			if (IsRowIdColumnId(column_id)) {
 				throw InvalidInputException("Paimon tables do not support selecting rowid");
@@ -827,6 +889,22 @@ static unique_ptr<GlobalTableFunctionState> PaimonScanInitGlobal(ClientContext &
                                                                  TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->Cast<PaimonScanBindData>();
 	auto state = make_uniq<PaimonScanGlobalState>();
+#ifdef PAIMON_VANE_DISTRIBUTED
+	switch (bind.distributed.phase) {
+	case PaimonDistributedScanPhase::COORDINATOR:
+		break;
+	case PaimonDistributedScanPhase::DISTRIBUTED_COORDINATOR:
+		throw InvalidInputException("A distributed Paimon coordinator scan cannot execute on a worker");
+	case PaimonDistributedScanPhase::WORKER_TEMPLATE:
+		throw InvalidInputException("A distributed Paimon worker scan requires an explicit split assignment");
+	case PaimonDistributedScanPhase::WORKER_ASSIGNED:
+		state->distributed_worker = true;
+		state->splits = bind.distributed.assigned_splits;
+		break;
+	default:
+		throw InternalException("Invalid distributed Paimon scan phase");
+	}
+#endif
 
 	// Remap predicates from table schema to read schema.
 	// The original predicate tree was constructed against the full table schema,
@@ -849,14 +927,26 @@ static unique_ptr<GlobalTableFunctionState> PaimonScanInitGlobal(ClientContext &
 		state->paimon_predicates = pred_res.value();
 	}
 
+#ifdef PAIMON_VANE_DISTRIBUTED
+	if (!state->distributed_worker) {
+		state->splits = CreatePaimonScanSplits(bind);
+	}
+#else
 	state->splits = CreatePaimonScanSplits(bind);
+#endif
 	if (bind.debug_expected_splits.has_value() && state->splits.size() != bind.debug_expected_splits.value()) {
 		throw InvalidInputException("Paimon scan planned %llu split(s), expected %llu",
 		                            NumericCast<unsigned long long>(state->splits.size()),
 		                            NumericCast<unsigned long long>(bind.debug_expected_splits.value()));
 	}
 	state->path = bind.table_data_path;
+#ifdef PAIMON_VANE_DISTRIBUTED
+	if (!state->distributed_worker) {
+		state->arrow_table = bind.arrow_table;
+	}
+#else
 	state->arrow_table = bind.arrow_table;
+#endif
 
 	return std::move(state);
 }
@@ -864,6 +954,11 @@ static unique_ptr<GlobalTableFunctionState> PaimonScanInitGlobal(ClientContext &
 static vector<PartitionStatistics> PaimonGetPartitionStats(ClientContext &, GetPartitionStatsInput &input) {
 	vector<PartitionStatistics> result;
 	auto &bind = input.bind_data->Cast<PaimonScanBindData>();
+#ifdef PAIMON_VANE_DISTRIBUTED
+	if (bind.distributed.phase != PaimonDistributedScanPhase::COORDINATOR) {
+		return result;
+	}
+#endif
 
 	// The current filter pushdown path keeps DuckDB residual filters for correctness.
 	// Only expose exact counts for unfiltered scans, where DuckDB can safely replace
@@ -935,6 +1030,32 @@ static void PaimonScan(ClientContext &context, TableFunctionInput &input, DataCh
 	}
 
 	auto &[c_array, c_schema] = batch;
+#ifdef PAIMON_VANE_DISTRIBUTED
+	ArrowTableSchema worker_arrow_table;
+	if (global_state.distributed_worker) {
+		if (!c_schema || !c_schema->release) {
+			if (c_array && c_array->release) {
+				c_array->release(c_array.get());
+			}
+			throw IOException("Distributed Paimon worker returned an invalid Arrow schema");
+		}
+		if (!c_array || !c_array->release || c_array->n_children < 0 ||
+		    NumericCast<idx_t>(c_array->n_children) != output.ColumnCount() + 1) {
+			c_schema->release(c_schema.get());
+			if (c_array && c_array->release) {
+				c_array->release(c_array.get());
+			}
+			throw IOException("Distributed Paimon worker returned an invalid Arrow batch");
+		}
+		try {
+			ArrowTableFunction::PopulateArrowTableSchema(context, worker_arrow_table, *c_schema);
+		} catch (...) {
+			c_schema->release(c_schema.get());
+			c_array->release(c_array.get());
+			throw;
+		}
+	}
+#endif
 	if (c_schema && c_schema->release) {
 		c_schema->release(c_schema.get());
 	}
@@ -946,12 +1067,31 @@ static void PaimonScan(ClientContext &context, TableFunctionInput &input, DataCh
 	auto output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, NumericCast<idx_t>(c_array->length));
 	output.SetCardinality(output_size);
 
+#ifdef PAIMON_VANE_DISTRIBUTED
+	const arrow_column_map_t *arrow_types;
+	if (global_state.distributed_worker) {
+		arrow_types = &worker_arrow_table.GetColumns();
+	} else {
+		arrow_types = &global_state.arrow_table.GetColumns();
+	}
+#else
 	auto &arrow_types = global_state.arrow_table.GetColumns();
+#endif
 
 	for (idx_t col_idx = 0; col_idx < output.ColumnCount(); col_idx++) {
 		// the first column is ignored
 		auto &child_array = *c_array->children[col_idx + 1];
+#ifdef PAIMON_VANE_DISTRIBUTED
+		idx_t arrow_type_index;
+		if (global_state.distributed_worker) {
+			arrow_type_index = col_idx + 1;
+		} else {
+			arrow_type_index = NumericCast<idx_t>(local_state.read_column_ids[col_idx]);
+		}
+		auto &arrow_type = *arrow_types->at(arrow_type_index);
+#else
 		auto &arrow_type = *arrow_types.at(local_state.read_column_ids[col_idx]);
+#endif
 
 		ArrowArrayScanState array_state(context);
 		array_state.owned_data = current_chunk;
@@ -981,6 +1121,9 @@ TableFunctionSet PaimonFunctions::GetPaimonScanFunction() {
 	fun.projection_pushdown = true;
 	fun.pushdown_complex_filter = PaimonPushdownFilter;
 	fun.get_partition_stats = PaimonGetPartitionStats;
+#ifdef PAIMON_VANE_DISTRIBUTED
+	ConfigurePaimonDistributedScan(fun);
+#endif
 	function_set.AddFunction(fun);
 
 	auto fun_fullpath = TableFunction({LogicalType::VARCHAR}, PaimonScan, PaimonScanBind, PaimonScanInitGlobal);
@@ -994,6 +1137,9 @@ TableFunctionSet PaimonFunctions::GetPaimonScanFunction() {
 	fun_fullpath.projection_pushdown = true;
 	fun_fullpath.pushdown_complex_filter = PaimonPushdownFilter;
 	fun_fullpath.get_partition_stats = PaimonGetPartitionStats;
+#ifdef PAIMON_VANE_DISTRIBUTED
+	ConfigurePaimonDistributedScan(fun_fullpath);
+#endif
 	function_set.AddFunction(fun_fullpath);
 
 	return function_set;
