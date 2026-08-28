@@ -50,6 +50,9 @@ public:
 	PhysicalPaimonInsert(PhysicalPlan &physical_plan, LogicalOperator &op, SchemaCatalogEntry &schema,
 	                     unique_ptr<BoundCreateTableInfo> info, paimon::Identifier table_identifier,
 	                     map<string, string> paimon_options, vector<string> part_keys, idx_t estimated_cardinality);
+#ifdef PAIMON_VANE_DISTRIBUTED
+	~PhysicalPaimonInsert() override;
+#endif
 
 	SchemaCatalogEntry *schema;
 	unique_ptr<BoundCreateTableInfo> info;
@@ -75,6 +78,7 @@ public:
 	int64_t distributed_snapshot_id = 0;
 	bool distributed_target_initialized = false;
 	bool distributed_worker_plan_selected = false;
+	mutable bool distributed_operation_open = false;
 	mutable bool distributed_finalize_started = false;
 #endif
 

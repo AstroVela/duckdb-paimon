@@ -553,11 +553,11 @@ def vane_attempt_manifests(table_path: Path) -> list[Path]:
     return sorted(path for path in manifest_root.rglob("*.commit") if path.is_file())
 
 
-def vane_operation_fences(table_path: Path) -> list[Path]:
-    fence_root = table_path.parent.parent / ".vane/paimon/fences"
-    if not fence_root.exists():
+def vane_open_operations(table_path: Path) -> list[Path]:
+    operation_root = table_path.parent.parent / ".vane/paimon/operations"
+    if not operation_root.exists():
         return []
-    return sorted(path for path in fence_root.rglob("*.closed") if path.is_file())
+    return sorted(path for path in operation_root.rglob("*.open") if path.is_file())
 
 
 def table_file_inventory(table_path: Path) -> list[Path]:
@@ -749,7 +749,7 @@ def exercise_unselected_attempt_artifact_cleanup(
     from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
     from vane.runners.local.runner import _InProcessFragmentExecutor
 
-    baseline_fences = set(vane_operation_fences(target_path))
+    baseline_open_operations = set(vane_open_operations(target_path))
     logical_plan = harness.capture_write_plan(
         lambda: source_insert_relation(harness, multi_path).insert_into(UNSELECTED_ATTEMPT_INSERT_TARGET)
     )
@@ -813,6 +813,8 @@ def exercise_unselected_attempt_artifact_cleanup(
                 # manifest scan and catalog commit.
                 if not retry_started.wait(timeout=WORKER_PLAN_CAPTURE_TIMEOUT_SECONDS):
                     raise TimeoutError("timed out waiting for the late unselected retry to start")
+                new_open_operations = set(vane_open_operations(target_path)) - baseline_open_operations
+                require_equal(len(new_open_operations), 1, "active INSERT operation marker count")
                 return selected_result
 
             handles[0].get_result_sync = get_result_with_unselected_retry
@@ -840,6 +842,11 @@ def exercise_unselected_attempt_artifact_cleanup(
             int(result.get("extension_task_result_count") or 0) >= WORKER_COUNT,
             "unselected attempt cleanup did not select enough worker tasks",
         )
+        require_equal(
+            set(vane_open_operations(target_path)),
+            baseline_open_operations,
+            "committed INSERT operation-marker cleanup",
+        )
         retry_release.set()
         require_equal(len(loser_handles), 1, "late unselected retry handle count")
         loser_handle = loser_handles[0]
@@ -859,7 +866,7 @@ def exercise_unselected_attempt_artifact_cleanup(
             finally:
                 loser_handle.release_result_payload()
         require_true(late_retry_error is not None, "late unselected retry unexpectedly succeeded")
-        if not error_chain_contains(late_retry_error, "operation is fenced"):
+        if not error_chain_contains(late_retry_error, "operation is closed"):
             raise AssertionError(
                 f"late unselected retry returned the wrong error: {late_retry_error!r}"
             ) from late_retry_error
@@ -895,8 +902,11 @@ def exercise_unselected_attempt_artifact_cleanup(
         [],
         "successful INSERT attempt-manifest cleanup",
     )
-    new_fences = set(vane_operation_fences(target_path)) - baseline_fences
-    require_equal(len(new_fences), 1, "successful INSERT operation fence count")
+    require_equal(
+        set(vane_open_operations(target_path)),
+        baseline_open_operations,
+        "successful INSERT retained operation markers",
+    )
     require_equal(
         snapshot_count(harness.connection, target_path),
         1,
@@ -916,6 +926,7 @@ def exercise_worker_failure_and_retry(
 ) -> None:
     vane = harness.vane
     baseline_files = table_file_inventory(target_path)
+    baseline_open_operations = set(vane_open_operations(target_path))
     relation = source_insert_relation(harness, multi_path).map_batches(
         FailSelectedPaimonWorker,
         schema={
@@ -943,6 +954,11 @@ def exercise_worker_failure_and_retry(
     )
     require_equal(vane_attempt_artifacts(target_path), [], "worker failure artifact cleanup")
     require_equal(table_file_inventory(target_path), baseline_files, "worker failure file cleanup")
+    require_equal(
+        set(vane_open_operations(target_path)),
+        baseline_open_operations,
+        "failed INSERT operation-marker cleanup",
+    )
 
     harness.require_write(
         "distributed Paimon INSERT retry after worker failure",
@@ -959,6 +975,11 @@ def exercise_worker_failure_and_retry(
         harness.connection.execute(f"SELECT count(*)::BIGINT, sum(id)::BIGINT FROM {FAILURE_INSERT_TARGET}").fetchone(),
         (80, 3160),
         "worker retry result",
+    )
+    require_equal(
+        set(vane_open_operations(target_path)),
+        baseline_open_operations,
+        "retried INSERT operation-marker cleanup",
     )
 
 
