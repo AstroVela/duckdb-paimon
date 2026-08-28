@@ -70,6 +70,7 @@ namespace {
 static constexpr uint32_t PAIMON_DISTRIBUTED_INSERT_PROTOCOL_VERSION = 1;
 static constexpr const char *PAIMON_DISTRIBUTED_INSERT_OPERATOR = "insert";
 static constexpr const char *PAIMON_DISTRIBUTED_INSERT_FRAGMENT_CODEC = "paimon.append-commit-fragment";
+static constexpr idx_t PAIMON_DISTRIBUTED_ATTEMPT_DIGEST_SIZE = 32;
 
 struct PaimonDistributedInsertTransport {
 	string operation_id;
@@ -123,6 +124,7 @@ struct PaimonDistributedTargetState {
 
 struct PaimonDecodedDistributedCommit {
 	std::vector<std::shared_ptr<paimon::CommitMessage>> messages;
+	unordered_set<string> selected_attempt_file_prefixes;
 	idx_t row_count = 0;
 };
 
@@ -533,8 +535,8 @@ static string FileName(const string &path) {
 	return separator == string::npos ? path : path.substr(separator + 1);
 }
 
-static void CleanupOperationFiles(const PaimonDistributedInsertTransport &transport,
-                                  const map<string, string> &options) {
+static void CleanupOperationFiles(const PaimonDistributedInsertTransport &transport, const map<string, string> &options,
+                                  optional_ptr<const unordered_set<string>> retained_file_prefixes = nullptr) {
 	auto file_system_entry = options.find(paimon::Options::FILE_SYSTEM);
 	if (file_system_entry == options.end() || file_system_entry->second.empty()) {
 		throw IOException("Distributed Paimon INSERT cleanup has no file-system identity");
@@ -548,6 +550,15 @@ static void CleanupOperationFiles(const PaimonDistributedInsertTransport &transp
 	unordered_set<string> visited_directories {transport.table_path};
 	vector<string> operation_files;
 	const auto operation_prefix = OperationDataFilePrefix(transport);
+	const auto attempt_prefix_size = operation_prefix.size() + PAIMON_DISTRIBUTED_ATTEMPT_DIGEST_SIZE;
+	if (retained_file_prefixes) {
+		for (const auto &prefix : *retained_file_prefixes) {
+			if (prefix.size() != attempt_prefix_size ||
+			    prefix.compare(0, operation_prefix.size(), operation_prefix) != 0) {
+				throw InternalException("Distributed Paimon INSERT has an invalid selected-attempt file prefix");
+			}
+		}
+	}
 	while (!pending_directories.empty()) {
 		auto directory = std::move(pending_directories.back());
 		pending_directories.pop_back();
@@ -573,7 +584,12 @@ static void CleanupOperationFiles(const PaimonDistributedInsertTransport &transp
 			}
 			auto name = FileName(path);
 			if (name.compare(0, operation_prefix.size(), operation_prefix) == 0) {
-				operation_files.push_back(std::move(path));
+				const auto retained =
+				    retained_file_prefixes && name.size() >= attempt_prefix_size &&
+				    retained_file_prefixes->find(name.substr(0, attempt_prefix_size)) != retained_file_prefixes->end();
+				if (!retained) {
+					operation_files.push_back(std::move(path));
+				}
 			}
 		}
 	}
@@ -926,6 +942,10 @@ static void DecodeCommitResults(const DistributedExtensionWriteInfo &info,
 		if (!logical_task_ids.insert(logical_task_id).second && duplicate_logical_task_id.empty()) {
 			duplicate_logical_task_id = std::move(logical_task_id);
 		}
+		DistributedWriteTaskContext task {result.query_id, result.task_attempt_id};
+		if (!decoded.selected_attempt_file_prefixes.insert(WorkerDataFilePrefix(transport, task)).second) {
+			throw InvalidInputException("Distributed Paimon INSERT selected attempts have colliding file namespaces");
+		}
 		if (result.fragments.empty()) {
 			if (result.RowCount() != 0 || result.ByteCount() != 0) {
 				throw InvalidInputException("Empty distributed Paimon INSERT task result has non-zero counts");
@@ -943,7 +963,6 @@ static void DecodeCommitResults(const DistributedExtensionWriteInfo &info,
 			throw InvalidInputException("Distributed Paimon INSERT task result has invalid fragment metadata");
 		}
 		auto envelope = DeserializeCommitEnvelope(fragment.payload);
-		DistributedWriteTaskContext task {result.query_id, result.task_attempt_id};
 		if (envelope.operation_id != transport.operation_id || envelope.table_uuid != transport.table_uuid ||
 		    envelope.table_path != transport.table_path ||
 		    envelope.schema_fingerprint != SchemaFingerprint(transport.table_schema_json) ||
@@ -1176,13 +1195,16 @@ idx_t PhysicalPaimonInsert::FinalizeDistributedWrite(ClientContext &context,
 			if (decoded.row_count != 0) {
 				throw InvalidInputException("Distributed Paimon INSERT returned rows without commit messages");
 			}
-			ValidateTargetBaseline(context, *this);
-			return 0;
-		}
-		if (decoded.row_count == 0) {
+		} else if (decoded.row_count == 0) {
 			throw InvalidInputException("Distributed Paimon INSERT returned commit messages without rows");
 		}
 		ValidateTargetBaseline(context, *this);
+		// Vane forwards only selected task results. Remove files from completed retry or speculative attempts while
+		// every selected attempt still has an immutable namespace and the catalog commit has not started.
+		CleanupOperationFiles(transport, options, &decoded.selected_attempt_file_prefixes);
+		if (decoded.messages.empty()) {
+			return 0;
+		}
 		committer = CreateCommitter(transport, options, coordinator_commit_user, true);
 		commits.emplace(transport.commit_identifier, decoded.messages);
 	} catch (...) {

@@ -38,6 +38,7 @@ FAILURE_INSERT_TARGET = "pm.vane_ray.failure_insert_target"
 CONFLICT_INSERT_TARGET = "pm.vane_ray.conflict_insert_target"
 SCHEMA_CONFLICT_INSERT_TARGET = "pm.vane_ray.schema_conflict_insert_target"
 ATTEMPT_METADATA_INSERT_TARGET = "pm.vane_ray.attempt_metadata_insert_target"
+UNSELECTED_ATTEMPT_INSERT_TARGET = "pm.vane_ray.unselected_attempt_insert_target"
 
 
 def require_equal(actual: object, expected: object, description: str) -> None:
@@ -388,6 +389,7 @@ def create_paimon_fixture(connection: object, warehouse: Path) -> tuple[Path, Pa
     connection.execute(f"CREATE TABLE {CONFLICT_INSERT_TARGET} (id INTEGER, part INTEGER, payload VARCHAR)")
     connection.execute(f"CREATE TABLE {SCHEMA_CONFLICT_INSERT_TARGET} (id INTEGER, part INTEGER, payload VARCHAR)")
     connection.execute(f"CREATE TABLE {ATTEMPT_METADATA_INSERT_TARGET} (id INTEGER, part INTEGER, payload VARCHAR)")
+    connection.execute(f"CREATE TABLE {UNSELECTED_ATTEMPT_INSERT_TARGET} (id INTEGER, part INTEGER, payload VARCHAR)")
 
     multi_path = warehouse / "vane_ray.db/multi_split"
     empty_path = warehouse / "vane_ray.db/empty_table"
@@ -403,6 +405,7 @@ def create_paimon_fixture(connection: object, warehouse: Path) -> tuple[Path, Pa
         CONFLICT_INSERT_TARGET: warehouse / "vane_ray.db/conflict_insert_target",
         SCHEMA_CONFLICT_INSERT_TARGET: warehouse / "vane_ray.db/schema_conflict_insert_target",
         ATTEMPT_METADATA_INSERT_TARGET: warehouse / "vane_ray.db/attempt_metadata_insert_target",
+        UNSELECTED_ATTEMPT_INSERT_TARGET: warehouse / "vane_ray.db/unselected_attempt_insert_target",
     }
     return multi_path, empty_path, int(snapshots[0][0]), int(snapshots[1][0]), target_paths
 
@@ -643,6 +646,99 @@ def exercise_duplicate_retry_attempt_metadata(
         f"SELECT count(*)::BIGINT, sum(id)::BIGINT FROM {ATTEMPT_METADATA_INSERT_TARGET}",
         [(80, 3160)],
         "attempt metadata retry result",
+    )
+
+
+def exercise_unselected_attempt_artifact_cleanup(
+    harness: RayPaimonHarness,
+    multi_path: Path,
+    target_path: Path,
+) -> None:
+    from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
+    from vane.runners.local.runner import _InProcessFragmentExecutor
+
+    logical_plan = harness.capture_write_plan(
+        lambda: source_insert_relation(harness, multi_path).insert_into(UNSELECTED_ATTEMPT_INSERT_TARGET)
+    )
+    physical_plan = logical_plan.to_physical_plan(harness.connection)
+    executor = _InProcessFragmentExecutor()
+    backend = NativeFteWorkerManagerBackend(
+        execute_fn=executor,
+        num_workers=WORKER_COUNT,
+        max_running_tasks=WORKER_COUNT,
+    )
+    original_submit_tasks = backend.submit_tasks
+    injected_artifacts: list[Path] = []
+    injection_lock = threading.Lock()
+
+    def inject_unselected_attempt_artifact() -> None:
+        with injection_lock:
+            if injected_artifacts:
+                return
+            selected_artifacts = [
+                path for path in vane_attempt_artifacts(target_path) if not path.name.endswith(".index")
+            ]
+            if not selected_artifacts:
+                return
+            selected_path = selected_artifacts[0]
+            operation_prefix_size = len("vane_") + 32 + 1
+            attempt_prefix_size = operation_prefix_size + 32
+            selected_name = selected_path.name
+            require_true(
+                len(selected_name) > attempt_prefix_size
+                and selected_name.startswith("vane_")
+                and selected_name[operation_prefix_size - 1] == "_",
+                "selected attempt artifact has an invalid Vane namespace",
+            )
+            selected_digest = selected_name[operation_prefix_size:attempt_prefix_size]
+            loser_digest = "0" * 32 if selected_digest != "0" * 32 else "f" * 32
+            loser_name = selected_name[:operation_prefix_size] + loser_digest + selected_name[attempt_prefix_size:]
+            loser_path = selected_path.with_name(loser_name)
+            loser_path.write_bytes(selected_path.read_bytes())
+            injected_artifacts.append(loser_path)
+
+    def submit_with_unselected_attempt_artifact(tasks: object) -> list[object]:
+        handles = list(original_submit_tasks(list(tasks)))
+        for handle in handles:
+            original_get_result = handle.get_result_sync
+
+            def get_result_with_unselected_attempt_artifact(
+                original_get_result: Callable[[], object] = original_get_result,
+            ) -> object:
+                result = original_get_result()
+                inject_unselected_attempt_artifact()
+                return result
+
+            handle.get_result_sync = get_result_with_unselected_attempt_artifact
+        return handles
+
+    backend.submit_tasks = submit_with_unselected_attempt_artifact
+    plan_runner = harness.vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    try:
+        result = plan_runner.run_copy_plan(physical_plan, harness.connection)
+        require_equal(result.get("extension_write"), True, "unselected attempt extension write marker")
+        require_equal(result.get("extension_catalog_committed"), True, "unselected attempt catalog commit")
+        require_equal(result.get("rows_copied"), 80, "unselected attempt affected rows")
+        require_true(
+            int(result.get("extension_task_result_count") or 0) >= WORKER_COUNT,
+            "unselected attempt cleanup did not select enough worker tasks",
+        )
+    finally:
+        try:
+            backend.shutdown()
+        finally:
+            executor.close()
+
+    require_true(bool(injected_artifacts), "unselected attempt artifact injection did not run")
+    require_true(
+        all(not path.exists() for path in injected_artifacts),
+        "unselected attempt artifacts remained after successful commit",
+    )
+    require_equal(snapshot_count(harness.connection, target_path), 1, "unselected attempt snapshot count")
+    harness.require_query(
+        f"SELECT count(*)::BIGINT, sum(id)::BIGINT FROM {UNSELECTED_ATTEMPT_INSERT_TARGET}",
+        [(80, 3160)],
+        "unselected attempt committed result",
     )
 
 
@@ -984,6 +1080,11 @@ def main() -> None:
                 harness,
                 multi_path,
                 target_paths[ATTEMPT_METADATA_INSERT_TARGET],
+            )
+            exercise_unselected_attempt_artifact_cleanup(
+                harness,
+                multi_path,
+                target_paths[UNSELECTED_ATTEMPT_INSERT_TARGET],
             )
             exercise_worker_failure_and_retry(
                 harness,
