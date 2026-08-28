@@ -146,6 +146,11 @@ set(EXTENSION_SOURCES
   src/paimon_storage/paimon_transaction_manager.cpp
   src/paimon_storage/paimon_type_utils.cpp)
 
+if(PAIMON_VANE_DISTRIBUTED)
+  list(APPEND EXTENSION_SOURCES
+       src/paimon_storage/paimon_distributed_scan.cpp)
+endif()
+
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
