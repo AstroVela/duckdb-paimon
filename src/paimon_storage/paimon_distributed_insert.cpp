@@ -41,6 +41,7 @@
 #include "duckdb/function/distributed_write.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
+#include "paimon/catalog/table.h"
 #include "paimon/commit_context.h"
 #include "paimon/commit_message.h"
 #include "paimon/defs.h"
@@ -74,6 +75,7 @@ struct PaimonDistributedInsertTransport {
 	string operation_id;
 	string database_name;
 	string table_name;
+	string table_uuid;
 	string table_path;
 	string table_schema_json;
 	int64_t schema_id = -1;
@@ -90,6 +92,7 @@ struct PaimonDistributedInsertTransport {
 
 struct PaimonDistributedCommitEnvelope {
 	string operation_id;
+	string table_uuid;
 	string table_path;
 	string schema_fingerprint;
 	int64_t schema_id = -1;
@@ -106,6 +109,7 @@ struct PaimonDistributedCommitEnvelope {
 };
 
 struct PaimonDistributedTargetState {
+	string table_uuid;
 	string table_path;
 	string table_schema_json;
 	int64_t schema_id = -1;
@@ -230,8 +234,8 @@ static map<string, string> GetPortableWriteOptions(const map<string, string> &op
 
 static void ValidateTransport(const PaimonDistributedInsertTransport &transport) {
 	if (!IsCanonicalUUID(transport.operation_id) || transport.database_name.empty() || transport.table_name.empty() ||
-	    transport.table_path.empty() || transport.table_schema_json.empty() || transport.schema_id < 0 ||
-	    transport.commit_identifier <= 0 || transport.input_types.empty() ||
+	    transport.table_uuid.empty() || transport.table_path.empty() || transport.table_schema_json.empty() ||
+	    transport.schema_id < 0 || transport.commit_identifier <= 0 || transport.input_types.empty() ||
 	    transport.input_types.size() != transport.input_names.size() || transport.null_part_name.empty()) {
 		throw SerializationException("Distributed Paimon INSERT bind has incomplete target state");
 	}
@@ -279,6 +283,7 @@ static void SerializeTransport(Serializer &serializer, const PaimonDistributedIn
 	serializer.WriteProperty(14, "null_part_name", transport.null_part_name);
 	serializer.WriteProperty(15, "portable_options", transport.portable_options);
 	serializer.WriteProperty(16, "append_only", transport.append_only);
+	serializer.WriteProperty(17, "table_uuid", transport.table_uuid);
 }
 
 static string SerializeTransport(const PaimonDistributedInsertTransport &transport) {
@@ -319,6 +324,7 @@ static PaimonDistributedInsertTransport DeserializeTransport(const string &bytes
 	result.null_part_name = deserializer.ReadProperty<string>(14, "null_part_name");
 	result.portable_options = deserializer.ReadProperty<map<string, string>>(15, "portable_options");
 	result.append_only = deserializer.ReadProperty<bool>(16, "append_only");
+	result.table_uuid = deserializer.ReadProperty<string>(17, "table_uuid");
 	deserializer.End();
 	ValidateTransport(result);
 	return result;
@@ -340,6 +346,7 @@ static void SerializeCommitEnvelope(Serializer &serializer, const PaimonDistribu
 	serializer.WriteProperty(13, "message_count", envelope.message_count);
 	serializer.WriteProperty(14, "row_count", envelope.row_count);
 	serializer.WriteProperty(15, "serialized_messages", envelope.serialized_messages);
+	serializer.WriteProperty(16, "table_uuid", envelope.table_uuid);
 }
 
 static string SerializeCommitEnvelope(const PaimonDistributedCommitEnvelope &envelope) {
@@ -379,12 +386,14 @@ static PaimonDistributedCommitEnvelope DeserializeCommitEnvelope(const string &b
 	result.message_count = deserializer.ReadProperty<idx_t>(13, "message_count");
 	result.row_count = deserializer.ReadProperty<idx_t>(14, "row_count");
 	result.serialized_messages = deserializer.ReadProperty<string>(15, "serialized_messages");
+	result.table_uuid = deserializer.ReadProperty<string>(16, "table_uuid");
 	deserializer.End();
-	if (!IsCanonicalUUID(result.operation_id) || result.table_path.empty() || result.schema_fingerprint.size() != 32 ||
-	    result.schema_id < 0 || result.commit_identifier <= 0 || result.query_id.empty() ||
-	    result.task_attempt_id.empty() || result.writer_commit_user.empty() || result.commit_message_version <= 0 ||
-	    result.message_count == 0 || result.row_count == 0 || result.serialized_messages.empty() ||
-	    (!result.has_snapshot && result.snapshot_id != 0) || (result.has_snapshot && result.snapshot_id <= 0)) {
+	if (!IsCanonicalUUID(result.operation_id) || result.table_uuid.empty() || result.table_path.empty() ||
+	    result.schema_fingerprint.size() != 32 || result.schema_id < 0 || result.commit_identifier <= 0 ||
+	    result.query_id.empty() || result.task_attempt_id.empty() || result.writer_commit_user.empty() ||
+	    result.commit_message_version <= 0 || result.message_count == 0 || result.row_count == 0 ||
+	    result.serialized_messages.empty() || (!result.has_snapshot && result.snapshot_id != 0) ||
+	    (result.has_snapshot && result.snapshot_id <= 0)) {
 		throw SerializationException("Distributed Paimon commit fragment contains invalid identity or payload state");
 	}
 	return result;
@@ -402,6 +411,19 @@ static PaimonDistributedTargetState LoadTargetState(PaimonCatalog &catalog,
 	}
 
 	PaimonDistributedTargetState result;
+	auto table_result = paimon_catalog.GetTable(table_identifier);
+	if (!table_result.ok()) {
+		throw IOException(table_result.status().ToString());
+	}
+	auto table = std::move(table_result).value();
+	if (!table) {
+		throw IOException("Paimon table %s has no stable table identity", table_identifier.ToString());
+	}
+	result.table_uuid = table->Uuid();
+	if (result.table_uuid.empty()) {
+		throw IOException("Paimon table %s has an empty table UUID", table_identifier.ToString());
+	}
+
 	auto path_result = paimon_catalog.GetTableLocation(table_identifier);
 	if (!path_result.ok()) {
 		throw IOException(path_result.status().ToString());
@@ -816,6 +838,7 @@ static vector<DistributedWriteFragment> PaimonDistributedInsertFinalize(ClientCo
 	}
 	PaimonDistributedCommitEnvelope envelope;
 	envelope.operation_id = global.transport.operation_id;
+	envelope.table_uuid = global.transport.table_uuid;
 	envelope.table_path = global.transport.table_path;
 	envelope.schema_fingerprint = SchemaFingerprint(global.transport.table_schema_json);
 	envelope.schema_id = global.transport.schema_id;
@@ -912,7 +935,8 @@ static void DecodeCommitResults(const DistributedExtensionWriteInfo &info,
 		}
 		auto envelope = DeserializeCommitEnvelope(fragment.payload);
 		DistributedWriteTaskContext task {result.query_id, result.task_attempt_id};
-		if (envelope.operation_id != transport.operation_id || envelope.table_path != transport.table_path ||
+		if (envelope.operation_id != transport.operation_id || envelope.table_uuid != transport.table_uuid ||
+		    envelope.table_path != transport.table_path ||
 		    envelope.schema_fingerprint != SchemaFingerprint(transport.table_schema_json) ||
 		    envelope.schema_id != transport.schema_id || envelope.has_snapshot != transport.has_snapshot ||
 		    envelope.snapshot_id != transport.snapshot_id ||
@@ -965,6 +989,7 @@ static PaimonDistributedInsertTransport GetCoordinatorTransport(const PhysicalPa
 	if (transport.operation_id != insert.distributed_operation_id ||
 	    transport.database_name != insert.table_identifier.GetDatabaseName() ||
 	    transport.table_name != insert.table_identifier.GetTableName() ||
+	    transport.table_uuid != insert.distributed_table_uuid ||
 	    transport.table_path != insert.distributed_table_path ||
 	    transport.table_schema_json != insert.distributed_table_schema_json ||
 	    transport.schema_id != insert.distributed_schema_id ||
@@ -1007,6 +1032,10 @@ static void ValidateTargetBaseline(ClientContext &, const PhysicalPaimonInsert &
 		throw PermissionException("Cannot write to a read-only Paimon catalog");
 	}
 	auto current = LoadTargetState(catalog, insert.table_identifier);
+	if (current.table_uuid != insert.distributed_table_uuid) {
+		throw TransactionException("Paimon table %s was replaced after the distributed INSERT was planned",
+		                           insert.table_identifier.ToString());
+	}
 	if (current.table_path != insert.distributed_table_path) {
 		throw TransactionException("Paimon table %s path changed after the distributed INSERT was planned",
 		                           insert.table_identifier.ToString());
@@ -1053,6 +1082,7 @@ void PhysicalPaimonInsert::InitializeDistributedWrite(ClientContext &, const vec
 	}
 	distributed_operation_id = UUID::ToString(UUID::GenerateRandomUUID());
 	distributed_commit_identifier = CreateCommitIdentifier(distributed_operation_id);
+	distributed_table_uuid = std::move(target.table_uuid);
 	distributed_table_path = std::move(target.table_path);
 	distributed_table_schema_json = std::move(target.table_schema_json);
 	distributed_schema_id = target.schema_id;
@@ -1068,6 +1098,7 @@ void PhysicalPaimonInsert::InitializeDistributedWrite(ClientContext &, const vec
 	transport.operation_id = distributed_operation_id;
 	transport.database_name = table_identifier.GetDatabaseName();
 	transport.table_name = table_identifier.GetTableName();
+	transport.table_uuid = distributed_table_uuid;
 	transport.table_path = distributed_table_path;
 	transport.table_schema_json = distributed_table_schema_json;
 	transport.schema_id = distributed_schema_id;
