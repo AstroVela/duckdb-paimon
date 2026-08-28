@@ -26,6 +26,10 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#ifdef PAIMON_VANE_DISTRIBUTED
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/path.hpp"
+#endif
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
@@ -56,14 +60,24 @@ static constexpr const char *S3_PATH_PREFIX = "s3://";
 static constexpr const char *OSS_PATH_PREFIX = "oss://";
 
 #ifdef PAIMON_VANE_DISTRIBUTED
+static string CanonicalVaneWarehouseIdentity(ClientContext &context, const string &path) {
+	auto parsed_path = Path::FromString(path);
+	if (parsed_path.IsRemote()) {
+		return parsed_path.ToString();
+	}
+	return FileSystem::GetFileSystem(context).CanonicalizePath(path);
+}
+
 shared_ptr<std::mutex> PaimonCatalog::GetVaneCatalogMutationMutex() const {
+	// Vane hosts the DuckDB sessions that participate in this extension-write protocol in one process. Independently
+	// managed processes require metastore-level coordination and are outside this in-process mutation contract.
 	static std::mutex registry_mutex;
 	static unordered_map<string, weak_ptr<std::mutex>> registry;
 	std::lock_guard<std::mutex> guard(registry_mutex);
-	auto result = registry[path].lock();
+	auto result = registry[vane_warehouse_identity].lock();
 	if (!result) {
 		result = make_shared_ptr<std::mutex>();
-		registry[path] = result;
+		registry[vane_warehouse_identity] = result;
 	}
 	return result;
 }
@@ -250,6 +264,9 @@ PaimonCatalog::PaimonCatalog(ClientContext &context, AttachedDatabase &db, const
                              const unordered_map<string, Value> &attach_options, AccessMode access_mode)
     : Catalog(db), path(path), access_mode(access_mode), attached_options(attach_options),
       paimon_catalog(CreatePaimonCatalog(context, path, attach_options)), schemas(*this) {
+#ifdef PAIMON_VANE_DISTRIBUTED
+	vane_warehouse_identity = CanonicalVaneWarehouseIdentity(context, path);
+#endif
 }
 
 unique_ptr<Catalog> PaimonCatalog::Attach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,

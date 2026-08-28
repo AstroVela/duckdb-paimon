@@ -105,6 +105,9 @@ public:
 
 #ifdef PAIMON_VANE_DISTRIBUTED
 	shared_ptr<std::mutex> GetVaneCatalogMutationMutex() const;
+	const string &GetVaneWarehouseIdentity() const {
+		return vane_warehouse_identity;
+	}
 #endif
 
 	const string &GetPath() const {
@@ -117,6 +120,9 @@ private:
 	unordered_map<string, Value> attached_options;
 	unique_ptr<paimon::Catalog> paimon_catalog;
 	PaimonSchemaSet schemas;
+#ifdef PAIMON_VANE_DISTRIBUTED
+	string vane_warehouse_identity;
+#endif
 
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 };

@@ -1371,7 +1371,7 @@ void PhysicalPaimonInsert::InitializeDistributedWrite(const vector<LogicalType> 
 	}
 	distributed_operation_id = UUID::ToString(UUID::GenerateRandomUUID());
 	distributed_commit_identifier = CreateCommitIdentifier(distributed_operation_id);
-	distributed_warehouse_path = catalog.GetPath();
+	distributed_warehouse_path = catalog.GetVaneWarehouseIdentity();
 	distributed_table_uuid = std::move(target.table_uuid);
 	distributed_table_path = std::move(target.table_path);
 	distributed_table_schema_json = std::move(target.table_schema_json);

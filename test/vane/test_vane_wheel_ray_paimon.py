@@ -1051,7 +1051,10 @@ def exercise_target_conflict_and_retry(
         try:
             verify_extension_is_wheel_linked(mutation_connection)
             warehouse = target_path.parent.parent
-            mutation_connection.execute(f"ATTACH {sql_string(warehouse)} AS conflict_pm (TYPE paimon)")
+            # Use a lexically different spelling of the coordinator warehouse so this conflict also exercises the
+            # canonical cross-ATTACH mutation-lock identity.
+            warehouse_alias = warehouse / "vane_ray.db/.."
+            mutation_connection.execute(f"ATTACH {sql_string(warehouse_alias)} AS conflict_pm (TYPE paimon)")
             mutation_connection.execute(
                 "INSERT INTO conflict_pm.vane_ray.conflict_insert_target VALUES (-1, 99, 'conflict')"
             )
