@@ -351,11 +351,6 @@ PhysicalOperator &PaimonCatalog::PlanInsert(ClientContext &context, PhysicalPlan
 	if (plan) {
 		insert.children.push_back(*plan);
 	}
-#ifdef PAIMON_VANE_DISTRIBUTED
-	if (plan) {
-		insert.Cast<PhysicalPaimonInsert>().InitializeDistributedWrite(context, insert.children[0].get().types);
-	}
-#endif
 	return insert;
 }
 

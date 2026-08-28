@@ -102,7 +102,7 @@ public:
 	                                 OperatorSourceInput &input) const override;
 
 #ifdef PAIMON_VANE_DISTRIBUTED
-	void InitializeDistributedWrite(ClientContext &context, const vector<LogicalType> &input_types);
+	void InitializeDistributedWrite(const vector<LogicalType> &input_types);
 	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override;
 	const distributed::DistributedExtensionWritePlan &WritePlan() const override;
 	void ValidateDistributedWrite(ClientContext &context) const override;

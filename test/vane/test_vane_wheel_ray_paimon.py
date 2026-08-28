@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -319,15 +320,38 @@ class RayPaimonHarness:
             raise AssertionError(f"{description}: Vane returned no distributed write result")
         result = self.last_write_result
         require_equal(result.get("extension_write"), True, f"{description} extension write marker")
-        require_equal(result.get("extension_write_name"), "insert", f"{description} extension write name")
-        require_equal(result.get("extension_write_mode"), "callback", f"{description} extension write mode")
-        require_equal(result.get("extension_catalog_committed"), True, f"{description} catalog commit")
+        require_equal(
+            result.get("extension_write_name"),
+            "insert",
+            f"{description} extension write name",
+        )
+        require_equal(
+            result.get("extension_write_mode"),
+            "callback",
+            f"{description} extension write mode",
+        )
+        require_equal(
+            result.get("extension_catalog_committed"),
+            True,
+            f"{description} catalog commit",
+        )
         require_equal(result.get("rows_copied"), expected_rows, f"{description} affected rows")
         task_results = int(result.get("extension_task_result_count", 0))
-        require_true(task_results >= minimum_task_results, f"{description} did not select enough worker tasks")
+        require_true(
+            task_results >= minimum_task_results,
+            f"{description} did not select enough worker tasks",
+        )
         expected_fragments = 0 if expected_rows == 0 else task_results
-        require_equal(result.get("extension_fragment_count"), expected_fragments, f"{description} fragments")
-        require_equal(result.get("extension_artifact_count"), 0, f"{description} opaque artifacts")
+        require_equal(
+            result.get("extension_fragment_count"),
+            expected_fragments,
+            f"{description} fragments",
+        )
+        require_equal(
+            result.get("extension_artifact_count"),
+            expected_fragments,
+            f"{description} attempt-manifest artifacts",
+        )
         return result
 
 
@@ -407,7 +431,13 @@ def create_paimon_fixture(connection: object, warehouse: Path) -> tuple[Path, Pa
         ATTEMPT_METADATA_INSERT_TARGET: warehouse / "vane_ray.db/attempt_metadata_insert_target",
         UNSELECTED_ATTEMPT_INSERT_TARGET: warehouse / "vane_ray.db/unselected_attempt_insert_target",
     }
-    return multi_path, empty_path, int(snapshots[0][0]), int(snapshots[1][0]), target_paths
+    return (
+        multi_path,
+        empty_path,
+        int(snapshots[0][0]),
+        int(snapshots[1][0]),
+        target_paths,
+    )
 
 
 def exercise_reads(
@@ -436,7 +466,11 @@ def exercise_reads(
 
     first_scan = f"paimon_scan({sql_string(multi_path)}, snapshot_from_id={first_snapshot})"
     second_scan = f"paimon_scan({sql_string(multi_path)}, snapshot_from_id={second_snapshot})"
-    require_equal(harness.scan_split_count(f"SELECT id FROM {first_scan}"), 4, "snapshot-one splits")
+    require_equal(
+        harness.scan_split_count(f"SELECT id FROM {first_scan}"),
+        4,
+        "snapshot-one splits",
+    )
     harness.require_query(
         f"SELECT count(*)::BIGINT, max(id) FROM {first_scan}",
         [(40, 39)],
@@ -449,7 +483,11 @@ def exercise_reads(
     )
 
     empty_scan = f"paimon_scan({sql_string(empty_path)})"
-    require_equal(harness.scan_split_count(f"SELECT id FROM {empty_scan}"), 1, "empty sentinel split")
+    require_equal(
+        harness.scan_split_count(f"SELECT id FROM {empty_scan}"),
+        1,
+        "empty sentinel split",
+    )
     harness.require_query(
         f"SELECT count(*)::BIGINT FROM {empty_scan}",
         [(0,)],
@@ -490,7 +528,11 @@ def exercise_worker_topology(
     )
     require_equal(harness.read_dispatch_count, previous_count + 1, "topology query Ray dispatch")
     require_equal(len(rows), 80, "topology query row count")
-    require_equal({str(row[1]) for row in rows}, expected_nodes, "Ray nodes consuming Paimon splits")
+    require_equal(
+        {str(row[1]) for row in rows},
+        expected_nodes,
+        "Ray nodes consuming Paimon splits",
+    )
     assert_vane_worker_topology(ray, harness.runner)
 
 
@@ -502,6 +544,13 @@ def snapshot_count(connection: object, table_path: Path) -> int:
 
 def vane_attempt_artifacts(table_path: Path) -> list[Path]:
     return sorted(path for path in table_path.rglob("vane_*") if path.is_file())
+
+
+def vane_attempt_manifests(table_path: Path) -> list[Path]:
+    manifest_root = table_path / ".vane/paimon"
+    if not manifest_root.exists():
+        return []
+    return sorted(path for path in manifest_root.rglob("*.commit") if path.is_file())
 
 
 def table_file_inventory(table_path: Path) -> list[Path]:
@@ -524,7 +573,11 @@ def exercise_distributed_inserts(
         expected_rows=80,
         minimum_task_results=2,
     )
-    require_equal(snapshot_count(connection, target_paths[INSERT_TARGET]), 1, "unpartitioned INSERT snapshots")
+    require_equal(
+        snapshot_count(connection, target_paths[INSERT_TARGET]),
+        1,
+        "unpartitioned INSERT snapshots",
+    )
     harness.require_query(
         f"SELECT count(*)::BIGINT, sum(id)::BIGINT FROM {INSERT_TARGET}",
         [(80, 3160)],
@@ -557,7 +610,11 @@ def exercise_distributed_inserts(
         expected_rows=0,
         minimum_task_results=1,
     )
-    require_equal(snapshot_count(connection, target_paths[EMPTY_INSERT_TARGET]), 0, "empty INSERT snapshots")
+    require_equal(
+        snapshot_count(connection, target_paths[EMPTY_INSERT_TARGET]),
+        0,
+        "empty INSERT snapshots",
+    )
     require_equal(
         connection.execute(f"SELECT count(*)::BIGINT FROM {EMPTY_INSERT_TARGET}").fetchone(),
         (0,),
@@ -610,13 +667,21 @@ def exercise_duplicate_retry_attempt_metadata(
     plan_runner = harness.vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
     try:
         result = plan_runner.run_copy_plan(physical_plan, harness.connection)
-        require_equal(result.get("extension_write"), True, "attempt metadata extension write marker")
+        require_equal(
+            result.get("extension_write"),
+            True,
+            "attempt metadata extension write marker",
+        )
         require_equal(
             result.get("extension_catalog_committed"),
             False,
             "attempt metadata catalog commit marker",
         )
-        require_equal(result.get("copy_output_outcome_unknown"), True, "attempt metadata runner outcome")
+        require_equal(
+            result.get("copy_output_outcome_unknown"),
+            True,
+            "attempt metadata runner outcome",
+        )
         require_true(
             "selected multiple attempts for Vane logical task" in str(result.get("copy_output_outcome_error") or ""),
             "attempt metadata rejection did not reach the Paimon coordinator",
@@ -625,10 +690,25 @@ def exercise_duplicate_retry_attempt_metadata(
             int(result.get("extension_task_result_count") or 0) > WORKER_COUNT,
             "attempt metadata rejection did not select the retried task result",
         )
-        require_true(bool(retried_attempt_ids), "duplicate/retried attempt injection did not reach a write task")
-        require_equal(snapshot_count(harness.connection, target_path), 0, "attempt metadata failure snapshots")
-        require_equal(vane_attempt_artifacts(target_path), [], "attempt metadata failure artifact cleanup")
-        require_equal(table_file_inventory(target_path), baseline_files, "attempt metadata failure file cleanup")
+        require_true(
+            bool(retried_attempt_ids),
+            "duplicate/retried attempt injection did not reach a write task",
+        )
+        require_equal(
+            snapshot_count(harness.connection, target_path),
+            0,
+            "attempt metadata failure snapshots",
+        )
+        require_equal(
+            vane_attempt_artifacts(target_path),
+            [],
+            "attempt metadata failure artifact cleanup",
+        )
+        require_equal(
+            table_file_inventory(target_path),
+            baseline_files,
+            "attempt metadata failure file cleanup",
+        )
     finally:
         try:
             backend.shutdown()
@@ -641,7 +721,11 @@ def exercise_duplicate_retry_attempt_metadata(
         expected_rows=80,
         minimum_task_results=2,
     )
-    require_equal(snapshot_count(harness.connection, target_path), 1, "attempt metadata retry snapshots")
+    require_equal(
+        snapshot_count(harness.connection, target_path),
+        1,
+        "attempt metadata retry snapshots",
+    )
     harness.require_query(
         f"SELECT count(*)::BIGINT, sum(id)::BIGINT FROM {ATTEMPT_METADATA_INSERT_TARGET}",
         [(80, 3160)],
@@ -654,6 +738,7 @@ def exercise_unselected_attempt_artifact_cleanup(
     multi_path: Path,
     target_path: Path,
 ) -> None:
+    from vane.runners.fte import FteTaskAttemptId
     from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
     from vane.runners.local.runner import _InProcessFragmentExecutor
 
@@ -667,57 +752,76 @@ def exercise_unselected_attempt_artifact_cleanup(
         num_workers=WORKER_COUNT,
         max_running_tasks=WORKER_COUNT,
     )
+    retry_executor = _InProcessFragmentExecutor()
+    retry_backend = NativeFteWorkerManagerBackend(
+        execute_fn=retry_executor,
+        num_workers=1,
+        max_running_tasks=1,
+    )
     original_submit_tasks = backend.submit_tasks
-    injected_artifacts: list[Path] = []
-    injection_lock = threading.Lock()
-
-    def inject_unselected_attempt_artifact() -> None:
-        with injection_lock:
-            if injected_artifacts:
-                return
-            selected_artifacts = [
-                path for path in vane_attempt_artifacts(target_path) if not path.name.endswith(".index")
-            ]
-            if not selected_artifacts:
-                return
-            selected_path = selected_artifacts[0]
-            operation_prefix_size = len("vane_") + 32 + 1
-            attempt_prefix_size = operation_prefix_size + 32
-            selected_name = selected_path.name
-            require_true(
-                len(selected_name) > attempt_prefix_size
-                and selected_name.startswith("vane_")
-                and selected_name[operation_prefix_size - 1] == "_",
-                "selected attempt artifact has an invalid Vane namespace",
-            )
-            selected_digest = selected_name[operation_prefix_size:attempt_prefix_size]
-            loser_digest = "0" * 32 if selected_digest != "0" * 32 else "f" * 32
-            loser_name = selected_name[:operation_prefix_size] + loser_digest + selected_name[attempt_prefix_size:]
-            loser_path = selected_path.with_name(loser_name)
-            loser_path.write_bytes(selected_path.read_bytes())
-            injected_artifacts.append(loser_path)
+    loser_attempt_digests: list[str] = []
+    retry_scheduled = False
 
     def submit_with_unselected_attempt_artifact(tasks: object) -> list[object]:
-        handles = list(original_submit_tasks(list(tasks)))
-        for handle in handles:
-            original_get_result = handle.get_result_sync
+        nonlocal retry_scheduled
+        task_list = list(tasks)
+        handles = list(original_submit_tasks(task_list))
+        if task_list and handles and not retry_scheduled:
+            retry_scheduled = True
+            retry_request = backend._request_from_task(task_list[0])
+            selected_id = FteTaskAttemptId.coerce(retry_request["task_id"])
+            retry_id = FteTaskAttemptId(selected_id.task_id, selected_id.attempt_id + 1)
+            retry_request["task_id"] = retry_id.to_dict()
+            retry_context = dict(retry_request.get("context") or {})
+            retry_context["attempt_id"] = str(retry_id.attempt_id)
+            retry_request["context"] = retry_context
+            original_get_result = handles[0].get_result_sync
 
-            def get_result_with_unselected_attempt_artifact(
-                original_get_result: Callable[[], object] = original_get_result,
-            ) -> object:
-                result = original_get_result()
-                inject_unselected_attempt_artifact()
-                return result
+            def get_result_with_unselected_retry() -> object:
+                selected_result = original_get_result()
+                loser_handles = list(retry_backend.submit_tasks([retry_request]))
+                require_equal(len(loser_handles), 1, "unselected retry handle count")
+                source_node_ids = list(retry_request.get("source_node_ids") or [])
+                if source_node_ids:
+                    retry_backend.task_input_stream_exhausted(retry_id.query_id, source_node_ids)
+                # Materialize a genuine successful retry but intentionally omit its handle from Vane's selected
+                # results. Its manifest is the only coordinator-visible recovery index for the discarded attempt.
+                loser_handle = loser_handles[0]
+                deadline = time.monotonic() + WORKER_PLAN_CAPTURE_TIMEOUT_SECONDS
+                while not loser_handle.done():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("timed out waiting for the unselected retry attempt")
+                    time.sleep(0.01)
+                loser_handle.get_result_sync()
+                loser_handle.ack()
+                loser_handle.release_result_payload()
+                digest = hashlib.md5()
+                digest.update(retry_id.query_id.encode())
+                digest.update(b"\0")
+                digest.update(str(retry_id).encode())
+                loser_attempt_digests.append(digest.hexdigest())
+                return selected_result
 
-            handle.get_result_sync = get_result_with_unselected_attempt_artifact
+            handles[0].get_result_sync = get_result_with_unselected_retry
         return handles
 
     backend.submit_tasks = submit_with_unselected_attempt_artifact
     plan_runner = harness.vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    blocked_directory = target_path / "unrelated/blocked"
+    blocked_directory.mkdir(parents=True)
+    blocked_directory.chmod(0)
     try:
         result = plan_runner.run_copy_plan(physical_plan, harness.connection)
-        require_equal(result.get("extension_write"), True, "unselected attempt extension write marker")
-        require_equal(result.get("extension_catalog_committed"), True, "unselected attempt catalog commit")
+        require_equal(
+            result.get("extension_write"),
+            True,
+            "unselected attempt extension write marker",
+        )
+        require_equal(
+            result.get("extension_catalog_committed"),
+            True,
+            "unselected attempt catalog commit",
+        )
         require_equal(result.get("rows_copied"), 80, "unselected attempt affected rows")
         require_true(
             int(result.get("extension_task_result_count") or 0) >= WORKER_COUNT,
@@ -725,16 +829,40 @@ def exercise_unselected_attempt_artifact_cleanup(
         )
     finally:
         try:
-            backend.shutdown()
+            blocked_directory.chmod(0o755)
         finally:
-            executor.close()
+            try:
+                backend.shutdown()
+            finally:
+                try:
+                    retry_backend.shutdown()
+                finally:
+                    try:
+                        executor.close()
+                    finally:
+                        retry_executor.close()
 
-    require_true(bool(injected_artifacts), "unselected attempt artifact injection did not run")
-    require_true(
-        all(not path.exists() for path in injected_artifacts),
-        "unselected attempt artifacts remained after successful commit",
+    require_true(bool(loser_attempt_digests), "unselected retry attempt did not run")
+    remaining_loser_artifacts = [
+        path
+        for path in vane_attempt_artifacts(target_path)
+        if any(digest in path.name for digest in loser_attempt_digests)
+    ]
+    require_equal(
+        remaining_loser_artifacts,
+        [],
+        "unselected retry attempt data/index cleanup",
     )
-    require_equal(snapshot_count(harness.connection, target_path), 1, "unselected attempt snapshot count")
+    require_equal(
+        vane_attempt_manifests(target_path),
+        [],
+        "successful INSERT attempt-manifest cleanup",
+    )
+    require_equal(
+        snapshot_count(harness.connection, target_path),
+        1,
+        "unselected attempt snapshot count",
+    )
     harness.require_query(
         f"SELECT count(*)::BIGINT, sum(id)::BIGINT FROM {UNSELECTED_ATTEMPT_INSERT_TARGET}",
         [(80, 3160)],
@@ -769,7 +897,11 @@ def exercise_worker_failure_and_retry(
         "intentional distributed Paimon worker failure",
     )
     require_equal(harness.write_dispatch_count, previous_count + 1, "worker failure Ray dispatch")
-    require_equal(snapshot_count(harness.connection, target_path), 0, "worker failure snapshot cleanup")
+    require_equal(
+        snapshot_count(harness.connection, target_path),
+        0,
+        "worker failure snapshot cleanup",
+    )
     require_equal(vane_attempt_artifacts(target_path), [], "worker failure artifact cleanup")
     require_equal(table_file_inventory(target_path), baseline_files, "worker failure file cleanup")
 
@@ -779,7 +911,11 @@ def exercise_worker_failure_and_retry(
         expected_rows=80,
         minimum_task_results=2,
     )
-    require_equal(snapshot_count(harness.connection, target_path), 1, "worker retry snapshot count")
+    require_equal(
+        snapshot_count(harness.connection, target_path),
+        1,
+        "worker retry snapshot count",
+    )
     require_equal(
         harness.connection.execute(f"SELECT count(*)::BIGINT, sum(id)::BIGINT FROM {FAILURE_INSERT_TARGET}").fetchone(),
         (80, 3160),
@@ -894,7 +1030,11 @@ def exercise_target_conflict_and_retry(
     require_equal(len(errors), 1, "target conflict failure count")
     if not error_chain_contains(errors[0], "snapshot changed after the distributed INSERT was planned"):
         raise AssertionError(f"target conflict returned the wrong error: {errors[0]!r}") from errors[0]
-    require_equal(snapshot_count(harness.connection, target_path), 1, "target conflict snapshot count")
+    require_equal(
+        snapshot_count(harness.connection, target_path),
+        1,
+        "target conflict snapshot count",
+    )
     require_equal(vane_attempt_artifacts(target_path), [], "target conflict artifact cleanup")
     require_equal(
         harness.connection.execute(f"SELECT id, part, payload FROM {CONFLICT_INSERT_TARGET} ORDER BY id").fetchall(),
@@ -908,7 +1048,11 @@ def exercise_target_conflict_and_retry(
         expected_rows=80,
         minimum_task_results=2,
     )
-    require_equal(snapshot_count(harness.connection, target_path), 2, "target conflict retry snapshots")
+    require_equal(
+        snapshot_count(harness.connection, target_path),
+        2,
+        "target conflict retry snapshots",
+    )
     require_equal(
         harness.connection.execute(
             f"SELECT count(*)::BIGINT, sum(id)::BIGINT FROM {CONFLICT_INSERT_TARGET}"
@@ -947,7 +1091,11 @@ def exercise_schema_conflict_and_retry(
     require_equal(len(errors), 1, "schema conflict failure count")
     if not error_chain_contains(errors[0], "schema changed after the distributed INSERT was planned"):
         raise AssertionError(f"schema conflict returned the wrong error: {errors[0]!r}") from errors[0]
-    require_equal(snapshot_count(harness.connection, target_path), 0, "schema conflict snapshot count")
+    require_equal(
+        snapshot_count(harness.connection, target_path),
+        0,
+        "schema conflict snapshot count",
+    )
     require_equal(vane_attempt_artifacts(target_path), [], "schema conflict artifact cleanup")
 
     harness.require_write(
@@ -956,7 +1104,11 @@ def exercise_schema_conflict_and_retry(
         expected_rows=80,
         minimum_task_results=2,
     )
-    require_equal(snapshot_count(harness.connection, target_path), 1, "schema conflict retry snapshots")
+    require_equal(
+        snapshot_count(harness.connection, target_path),
+        1,
+        "schema conflict retry snapshots",
+    )
     require_equal(
         harness.connection.execute(
             f"SELECT count(*)::BIGINT, sum(id)::BIGINT FROM {SCHEMA_CONFLICT_INSERT_TARGET}"
@@ -1101,8 +1253,14 @@ def main() -> None:
                 multi_path,
                 target_paths[SCHEMA_CONFLICT_INSERT_TARGET],
             )
-            require_true(harness.read_dispatch_count >= 9, "Ray suite did not exercise enough reads")
-            require_true(harness.write_dispatch_count >= 9, "Ray suite did not exercise enough writes")
+            require_true(
+                harness.read_dispatch_count >= 9,
+                "Ray suite did not exercise enough reads",
+            )
+            require_true(
+                harness.write_dispatch_count >= 9,
+                "Ray suite did not exercise enough writes",
+            )
     finally:
         try:
             if connection is not None:
