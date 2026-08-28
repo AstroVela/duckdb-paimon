@@ -37,6 +37,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/function/distributed_write.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -155,15 +156,18 @@ struct PaimonDistributedRecoveryRecord {
 
 static bool IsAttemptManifestName(const string &name);
 
+enum class PaimonDistributedRuntimeOperationState : uint8_t { ACTIVE = 1, CLOSED = 2, COMMIT_ACKNOWLEDGED = 3 };
+
 // Paimon catalog mutations are serialized by a process-wide warehouse mutex. This companion registry distinguishes
 // markers owned by live coordinators in that same supported coordination scope from markers left by a terminated
-// coordinator process.
+// coordinator process. It also bridges a transient post-commit storage failure: every operation is registered before
+// workers start, so recording an acknowledged catalog commit is an allocation-free state transition.
 static mutex active_operation_lock;
-static unordered_set<string> active_operation_ids;
+static unordered_map<string, PaimonDistributedRuntimeOperationState> runtime_operation_states;
 
 static void RegisterActiveOperation(const string &operation_id) {
 	std::lock_guard<mutex> guard(active_operation_lock);
-	if (!active_operation_ids.insert(operation_id).second) {
+	if (!runtime_operation_states.emplace(operation_id, PaimonDistributedRuntimeOperationState::ACTIVE).second) {
 		throw InternalException("Distributed Paimon INSERT operation was registered more than once");
 	}
 }
@@ -174,14 +178,73 @@ static void UnregisterActiveOperation(const string &operation_id) noexcept {
 	}
 	try {
 		std::lock_guard<mutex> guard(active_operation_lock);
-		active_operation_ids.erase(operation_id);
+		auto operation = runtime_operation_states.find(operation_id);
+		if (operation != runtime_operation_states.end() &&
+		    operation->second != PaimonDistributedRuntimeOperationState::COMMIT_ACKNOWLEDGED) {
+			runtime_operation_states.erase(operation);
+		}
+	} catch (...) {
+	}
+}
+
+static void MarkOperationClosed(const string &operation_id) noexcept {
+	if (operation_id.empty()) {
+		return;
+	}
+	try {
+		std::lock_guard<mutex> guard(active_operation_lock);
+		auto operation = runtime_operation_states.find(operation_id);
+		if (operation != runtime_operation_states.end() &&
+		    operation->second == PaimonDistributedRuntimeOperationState::ACTIVE) {
+			operation->second = PaimonDistributedRuntimeOperationState::CLOSED;
+		}
+	} catch (...) {
+	}
+}
+
+static void MarkCommitAcknowledged(const string &operation_id) noexcept {
+	try {
+		std::lock_guard<mutex> guard(active_operation_lock);
+		auto operation = runtime_operation_states.find(operation_id);
+		if (operation != runtime_operation_states.end()) {
+			operation->second = PaimonDistributedRuntimeOperationState::COMMIT_ACKNOWLEDGED;
+		}
+	} catch (...) {
+	}
+}
+
+static void PrepareRuntimeRecoveryCommit(const string &operation_id) {
+	std::lock_guard<mutex> guard(active_operation_lock);
+	auto operation = runtime_operation_states.find(operation_id);
+	if (operation == runtime_operation_states.end()) {
+		runtime_operation_states.emplace(operation_id, PaimonDistributedRuntimeOperationState::CLOSED);
+		return;
+	}
+	if (operation->second == PaimonDistributedRuntimeOperationState::ACTIVE) {
+		throw InternalException("Distributed Paimon recovery attempted to commit an active operation");
+	}
+}
+
+static void ForgetRuntimeOperation(const string &operation_id) noexcept {
+	try {
+		std::lock_guard<mutex> guard(active_operation_lock);
+		runtime_operation_states.erase(operation_id);
 	} catch (...) {
 	}
 }
 
 static bool IsActiveOperation(const string &operation_id) {
 	std::lock_guard<mutex> guard(active_operation_lock);
-	return active_operation_ids.find(operation_id) != active_operation_ids.end();
+	auto operation = runtime_operation_states.find(operation_id);
+	return operation != runtime_operation_states.end() &&
+	       operation->second == PaimonDistributedRuntimeOperationState::ACTIVE;
+}
+
+static bool RuntimeCommitWasAcknowledged(const string &operation_id) {
+	std::lock_guard<mutex> guard(active_operation_lock);
+	auto operation = runtime_operation_states.find(operation_id);
+	return operation != runtime_operation_states.end() &&
+	       operation->second == PaimonDistributedRuntimeOperationState::COMMIT_ACKNOWLEDGED;
 }
 
 static idx_t CheckedAdd(idx_t left, idx_t right, const char *description) {
@@ -761,6 +824,18 @@ static void PublishRecoveryCompletion(const PaimonDistributedRecoveryIntent &int
 	if (intent.action != PaimonDistributedRecoveryAction::COMMIT) {
 		throw InternalException("Distributed Paimon abort intent cannot publish commit completion");
 	}
+	// The intent is already durable before the catalog commit. Promote those exact bytes first, avoiding a second
+	// content write in the post-commit window. If rename is unsupported, fails, or has an ambiguous outcome, the
+	// immutable-store path both supplies a fallback and recognizes a rename that actually reached its destination.
+	auto file_system = GetFileSystem(intent.transport, options);
+	auto status = file_system->Rename(RecoveryIntentPath(intent.transport), RecoveryCompletionPath(intent.transport));
+	if (status.ok()) {
+		if (!RecoveryRecordMatches(*file_system, RecoveryCompletionPath(intent.transport), payload,
+		                           "commit completion")) {
+			throw IOException("Distributed Paimon recovery commit completion disappeared after publication");
+		}
+		return;
+	}
 	bool publication_may_exist = false;
 	PublishRecoveryRecord(intent.transport, RecoveryCompletionPath(intent.transport), payload, options,
 	                      publication_may_exist, "commit completion");
@@ -853,7 +928,7 @@ static void CloseOperation(const PaimonDistributedInsertTransport &transport, co
 	auto status = file_system->Delete(path, false);
 	if (!OperationIsOpen(*file_system, transport)) {
 		BestEffortDeleteOperationDirectories(*file_system, transport);
-		UnregisterActiveOperation(transport.operation_id);
+		MarkOperationClosed(transport.operation_id);
 		return;
 	}
 	if (!status.ok() && !status.IsNotExist()) {
@@ -1411,16 +1486,23 @@ static void RecoverPendingOperations(PaimonCatalog &catalog, const paimon::Ident
 			              decoded.messages);
 			CleanupAttemptManifests(intent.transport, options);
 		} else {
-			auto commit_completed = record.commit_completed;
-			if (!commit_completed && RecoveryCommitIsVisible(catalog, table_identifier, intent.transport)) {
-				// Snapshot retention is not a durable commit ledger. Capture positive evidence while it is still
-				// visible so later recovery never depends on the originating snapshot remaining retained.
-				PublishRecoveryCompletion(intent, record.payload, options);
-				commit_completed = true;
-			}
-			if (!commit_completed) {
-				auto target = LoadTargetState(catalog, table_identifier);
-				if (!TargetMatchesRecoveryBaseline(target, intent.transport)) {
+			auto target = LoadTargetState(catalog, table_identifier);
+			if (target.table_uuid != intent.transport.table_uuid) {
+				// A replacement at the same path cannot contain this operation's commit. Its files belong to the old
+				// logical table and are safe to abort instead of retaining an unrecoverable ambiguous intent.
+				AbortMessages(intent.transport, options, "vane-" + CompactUUID(intent.transport.operation_id),
+				              decoded.messages);
+				CleanupAttemptManifests(intent.transport, options);
+			} else {
+				auto commit_completed =
+				    record.commit_completed || RuntimeCommitWasAcknowledged(intent.transport.operation_id);
+				if (!commit_completed && RecoveryCommitIsVisible(catalog, table_identifier, intent.transport)) {
+					// Snapshot retention is not a durable commit ledger. Capture positive evidence while it is still
+					// visible so later recovery never depends on the originating snapshot remaining retained.
+					PublishRecoveryCompletion(intent, record.payload, options);
+					commit_completed = true;
+				}
+				if (!commit_completed && !TargetMatchesRecoveryBaseline(target, intent.transport)) {
 					// An advanced baseline with no retained matching snapshot is ambiguous: the operation may have
 					// committed and its snapshot may already have expired. Losers remain safe to abort, but selected
 					// files must stay owned by the durable intent until there is positive commit evidence.
@@ -1431,30 +1513,34 @@ static void RecoverPendingOperations(PaimonCatalog &catalog, const paimon::Ident
 					    intent.transport.operation_id);
 				}
 				CleanupAttemptManifests(intent.transport, options, &decoded.selected_attempt_manifests, false);
-				auto committer = CreateCommitter(intent.transport, options,
-				                                 "vane-" + CompactUUID(intent.transport.operation_id), true);
-				std::map<int64_t, std::vector<std::shared_ptr<paimon::CommitMessage>>> commits;
-				commits.emplace(intent.transport.commit_identifier, decoded.messages);
-				auto commit_result = committer->FilterAndCommit(commits);
-				if (!commit_result.ok()) {
-					throw IOException("Failed to recover distributed Paimon INSERT commit: %s",
-					                  commit_result.status().ToString());
+				if (!commit_completed) {
+					auto committer = CreateCommitter(intent.transport, options,
+					                                 "vane-" + CompactUUID(intent.transport.operation_id), true);
+					std::map<int64_t, std::vector<std::shared_ptr<paimon::CommitMessage>>> commits;
+					commits.emplace(intent.transport.commit_identifier, decoded.messages);
+					PrepareRuntimeRecoveryCommit(intent.transport.operation_id);
+					auto commit_result = committer->FilterAndCommit(commits);
+					if (!commit_result.ok()) {
+						ForgetRuntimeOperation(intent.transport.operation_id);
+						throw IOException("Failed to recover distributed Paimon INSERT commit: %s",
+						                  commit_result.status().ToString());
+					}
+					if (commit_result.value() < 0 || commit_result.value() > 1) {
+						ForgetRuntimeOperation(intent.transport.operation_id);
+						throw IOException(
+						    "Failed to recover distributed Paimon INSERT commit: invalid committed-operation count %d",
+						    commit_result.value());
+					}
+					MarkCommitAcknowledged(intent.transport.operation_id);
+					PublishRecoveryCompletion(intent, record.payload, options);
+					ForgetRuntimeOperation(intent.transport.operation_id);
 				}
-				if (commit_result.value() < 0 || commit_result.value() > 1) {
-					throw IOException("Failed to recover distributed Paimon INSERT commit: invalid committed-operation "
-					                  "count %d",
-					                  commit_result.value());
-				}
-				PublishRecoveryCompletion(intent, record.payload, options);
-			} else {
-				// A worker can publish after the coordinator's pre-commit scan and then terminate before its
-				// post-publication marker check. Completed recovery still owns and aborts those late losers.
-				CleanupAttemptManifests(intent.transport, options, &decoded.selected_attempt_manifests, false);
 			}
 			DeleteSelectedAttemptManifests(intent.transport, options, decoded.selected_attempt_manifests);
 		}
 		auto file_system = GetFileSystem(intent.transport, options);
 		DeleteRecoveryRecords(*file_system, intent.transport);
+		ForgetRuntimeOperation(intent.transport.operation_id);
 	}
 	RecoverOrphanedOpenOperations(table_identifier, table_path, base_options);
 }
@@ -2178,18 +2264,25 @@ idx_t PhysicalPaimonInsert::FinalizeDistributedWrite(ClientContext &context,
 			    "Distributed Paimon INSERT commit outcome is unknown: expected at most one committed operation, got %d",
 			    commit_result.value());
 		}
+		MarkCommitAcknowledged(transport.operation_id);
 		// Snapshot expiry can erase the catalog's commit-user evidence. Persist the acknowledged outcome before
 		// deleting prepared artifacts so later recovery never infers failure from a missing retained snapshot. A
 		// bookkeeping failure after the catalog acknowledged the commit must not turn successful INSERT rows into a
-		// user-visible failure; the pending intent and selected artifacts remain available for recovery instead.
+		// user-visible failure; the promoted record or preallocated runtime state remains available for recovery.
 		auto completion_published = BestEffortPublishRecoveryCompletion(recovery_intent, recovery_payload, options);
-		// Delete recovery records only after every operation-scoped artifact is confirmed absent. A failed cleanup
-		// leaves durable completion evidence in place and does not turn a successful catalog commit into a
-		// user-visible failure.
-		if (completion_published &&
-		    BestEffortDeleteSelectedAttemptManifests(transport, options, decoded.selected_attempt_manifests) &&
+		if (completion_published) {
+			ForgetRuntimeOperation(transport.operation_id);
+		}
+		// Once the catalog acknowledged the commit, selected manifests are only bookkeeping. Remove all recovery
+		// state when their cleanup succeeds even if completion publication failed; otherwise retry completion after
+		// cleanup and retain either its durable evidence or the allocation-free runtime outcome for recovery.
+		if (BestEffortDeleteSelectedAttemptManifests(transport, options, decoded.selected_attempt_manifests) &&
 		    BestEffortDeleteRecoveryRecords(transport, options)) {
 			distributed_recovery_intent_published = false;
+			ForgetRuntimeOperation(transport.operation_id);
+		} else if (!completion_published &&
+		           BestEffortPublishRecoveryCompletion(recovery_intent, recovery_payload, options)) {
+			ForgetRuntimeOperation(transport.operation_id);
 		}
 	} catch (...) {
 		if (!distributed_recovery_intent_published) {
