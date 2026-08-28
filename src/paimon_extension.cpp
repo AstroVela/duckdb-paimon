@@ -23,6 +23,9 @@
  */
 
 #include "paimon_catalog.hpp"
+#ifdef PAIMON_VANE_DISTRIBUTED
+#include "paimon_distributed_insert.hpp"
+#endif
 #include "paimon_extension.hpp"
 #include "paimon_functions.hpp"
 
@@ -87,6 +90,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	for (auto &fun : PaimonFunctions::GetTableFunctions()) {
 		loader.RegisterFunction(fun);
 	}
+
+#ifdef PAIMON_VANE_DISTRIBUTED
+	RegisterPaimonDistributedWrites(loader);
+#endif
 
 	auto &instance = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(instance);

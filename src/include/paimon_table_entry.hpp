@@ -42,6 +42,10 @@ public:
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
 	virtual_column_map_t GetVirtualColumns() const override;
 	vector<column_t> GetRowIdColumns() const override;
+#ifdef PAIMON_VANE_DISTRIBUTED
+	string GetLogicalWriteTargetIdentity() const override;
+	string GetLogicalWriteTargetDefinition(ClientContext &context) override;
+#endif
 };
 
 } // namespace duckdb

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -48,6 +49,36 @@ def verify_extension_is_wheel_linked(connection: object) -> None:
     require_equal(loaded, (True, "STATICALLY_LINKED"), "Paimon after LOAD")
 
 
+def exercise_local_fast_insert(connection: object) -> None:
+    with tempfile.TemporaryDirectory(prefix="vane-paimon-local-insert-") as warehouse_text:
+        warehouse = Path(warehouse_text).resolve()
+        connection.execute(f"ATTACH {sql_string(warehouse)} AS local_pm (TYPE paimon)")
+        connection.execute("CREATE SCHEMA local_pm.local_insert")
+        connection.execute(
+            "CREATE TABLE local_pm.local_insert.target "
+            "(id INTEGER, part INTEGER, payload VARCHAR) PARTITIONED BY (part)"
+        )
+        source = connection.sql(
+            "SELECT i::INTEGER AS id, (i % 3)::INTEGER AS part, "
+            "('local-' || i::VARCHAR)::VARCHAR AS payload FROM range(0, 12) source(i)"
+        )
+        source.insert_into("local_pm.local_insert.target")
+        connection.execute("INSERT INTO local_pm.local_insert.target (id, payload) " "VALUES (12, 'local-partial')")
+        require_equal(
+            connection.execute(
+                "SELECT count(*)::BIGINT, sum(id)::BIGINT, count(DISTINCT part)::BIGINT "
+                "FROM local_pm.local_insert.target"
+            ).fetchone(),
+            (13, 78, 3),
+            "local-fast native Paimon INSERT",
+        )
+        require_equal(
+            connection.execute("SELECT id, part, payload FROM local_pm.local_insert.target WHERE id = 12").fetchone(),
+            (12, None, "local-partial"),
+            "local-fast native partial-column Paimon INSERT",
+        )
+
+
 def main() -> None:
     if os.environ.get("VANE_RUNNER") != "local-fast":
         raise RuntimeError("the wheel integration test requires VANE_RUNNER=local-fast")
@@ -74,6 +105,7 @@ def main() -> None:
             [("David", 21.0), ("Eve", 22.1), ("Frank", 23.2)],
             "local-fast projection and residual filter",
         )
+        exercise_local_fast_insert(connection)
     finally:
         connection.close()
 
