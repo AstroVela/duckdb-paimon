@@ -155,6 +155,35 @@ struct PaimonDistributedRecoveryRecord {
 
 static bool IsAttemptManifestName(const string &name);
 
+// Paimon catalog mutations are serialized by a process-wide warehouse mutex. This companion registry distinguishes
+// markers owned by live coordinators in that same supported coordination scope from markers left by a terminated
+// coordinator process.
+static mutex active_operation_lock;
+static unordered_set<string> active_operation_ids;
+
+static void RegisterActiveOperation(const string &operation_id) {
+	std::lock_guard<mutex> guard(active_operation_lock);
+	if (!active_operation_ids.insert(operation_id).second) {
+		throw InternalException("Distributed Paimon INSERT operation was registered more than once");
+	}
+}
+
+static void UnregisterActiveOperation(const string &operation_id) noexcept {
+	if (operation_id.empty()) {
+		return;
+	}
+	try {
+		std::lock_guard<mutex> guard(active_operation_lock);
+		active_operation_ids.erase(operation_id);
+	} catch (...) {
+	}
+}
+
+static bool IsActiveOperation(const string &operation_id) {
+	std::lock_guard<mutex> guard(active_operation_lock);
+	return active_operation_ids.find(operation_id) != active_operation_ids.end();
+}
+
 static idx_t CheckedAdd(idx_t left, idx_t right, const char *description) {
 	if (right > NumericLimits<idx_t>::Maximum() - left) {
 		throw InvalidInputException("Distributed Paimon INSERT %s exceeds idx_t", description);
@@ -256,9 +285,12 @@ static string OperationRoot(const PaimonDistributedInsertTransport &transport) {
 	return JoinPath(transport.table_path, ".vane/paimon/" + string(PAIMON_DISTRIBUTED_OPERATION_DIRECTORY));
 }
 
+static string OperationMarkerName(const PaimonDistributedInsertTransport &transport) {
+	return CompactUUID(transport.operation_id) + PAIMON_DISTRIBUTED_OPERATION_MARKER_SUFFIX;
+}
+
 static string OperationMarkerPath(const PaimonDistributedInsertTransport &transport) {
-	return JoinPath(OperationRoot(transport),
-	                CompactUUID(transport.operation_id) + PAIMON_DISTRIBUTED_OPERATION_MARKER_SUFFIX);
+	return JoinPath(OperationRoot(transport), OperationMarkerName(transport));
 }
 
 static string RecoveryRoot(const PaimonDistributedInsertTransport &transport) {
@@ -679,15 +711,7 @@ static std::unique_ptr<paimon::FileSystem> GetFileSystem(const PaimonDistributed
 }
 
 static string SerializeOperationMarker(const PaimonDistributedInsertTransport &transport) {
-	MemoryStream stream(Allocator::DefaultAllocator());
-	BinarySerializer serializer(stream);
-	serializer.Begin();
-	serializer.WriteProperty(1, "protocol_version", PAIMON_DISTRIBUTED_INSERT_PROTOCOL_VERSION);
-	serializer.WriteProperty(2, "operation_id", transport.operation_id);
-	serializer.WriteProperty(3, "table_uuid", transport.table_uuid);
-	serializer.WriteProperty(4, "table_path", transport.table_path);
-	serializer.End();
-	return string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
+	return SerializeTransport(transport);
 }
 
 static bool RecoveryRecordMatches(paimon::FileSystem &file_system, const string &path, const string &payload,
@@ -740,6 +764,16 @@ static void PublishRecoveryCompletion(const PaimonDistributedRecoveryIntent &int
 	bool publication_may_exist = false;
 	PublishRecoveryRecord(intent.transport, RecoveryCompletionPath(intent.transport), payload, options,
 	                      publication_may_exist, "commit completion");
+}
+
+static bool BestEffortPublishRecoveryCompletion(const PaimonDistributedRecoveryIntent &intent, const string &payload,
+                                                const map<string, string> &options) noexcept {
+	try {
+		PublishRecoveryCompletion(intent, payload, options);
+		return true;
+	} catch (...) {
+		return false;
+	}
 }
 
 static void DeleteRecoveryRecord(paimon::FileSystem &file_system, const string &path, const char *description) {
@@ -819,6 +853,7 @@ static void CloseOperation(const PaimonDistributedInsertTransport &transport, co
 	auto status = file_system->Delete(path, false);
 	if (!OperationIsOpen(*file_system, transport)) {
 		BestEffortDeleteOperationDirectories(*file_system, transport);
+		UnregisterActiveOperation(transport.operation_id);
 		return;
 	}
 	if (!status.ok() && !status.IsNotExist()) {
@@ -862,7 +897,7 @@ static bool IsAttemptManifestName(const string &name) {
 	return true;
 }
 
-static bool IsRecoveryRecordName(const string &name, const char *record_suffix) {
+static bool IsOperationScopedRecordName(const string &name, const char *record_suffix) {
 	const string suffix = record_suffix;
 	if (name.size() != PAIMON_DISTRIBUTED_ATTEMPT_DIGEST_SIZE + suffix.size() ||
 	    name.compare(PAIMON_DISTRIBUTED_ATTEMPT_DIGEST_SIZE, suffix.size(), suffix) != 0) {
@@ -877,12 +912,16 @@ static bool IsRecoveryRecordName(const string &name, const char *record_suffix) 
 	return true;
 }
 
+static bool IsOperationMarkerName(const string &name) {
+	return IsOperationScopedRecordName(name, PAIMON_DISTRIBUTED_OPERATION_MARKER_SUFFIX);
+}
+
 static bool IsRecoveryIntentName(const string &name) {
-	return IsRecoveryRecordName(name, PAIMON_DISTRIBUTED_RECOVERY_INTENT_SUFFIX);
+	return IsOperationScopedRecordName(name, PAIMON_DISTRIBUTED_RECOVERY_INTENT_SUFFIX);
 }
 
 static bool IsRecoveryCompletionName(const string &name) {
-	return IsRecoveryRecordName(name, PAIMON_DISTRIBUTED_RECOVERY_COMPLETION_SUFFIX);
+	return IsOperationScopedRecordName(name, PAIMON_DISTRIBUTED_RECOVERY_COMPLETION_SUFFIX);
 }
 
 static void ValidateAttemptManifestEnvelope(const PaimonDistributedInsertTransport &transport,
@@ -1248,6 +1287,76 @@ static vector<PaimonDistributedRecoveryRecord> LoadRecoveryRecords(const paimon:
 	return result;
 }
 
+static vector<PaimonDistributedInsertTransport> LoadOpenOperations(const paimon::Identifier &table_identifier,
+                                                                   const string &table_path,
+                                                                   const map<string, string> &options) {
+	PaimonDistributedInsertTransport table_transport;
+	table_transport.table_path = table_path;
+	auto file_system = GetFileSystem(table_transport, options);
+	const auto directory = OperationRoot(table_transport);
+	std::vector<std::unique_ptr<paimon::BasicFileStatus>> entries;
+	auto status = file_system->ListDir(directory, &entries);
+	if (!status.ok()) {
+		if (status.IsNotExist()) {
+			return {};
+		}
+		throw IOException("Failed to list distributed Paimon open operations: %s", status.ToString());
+	}
+	vector<pair<string, string>> payloads;
+	for (auto &entry : entries) {
+		if (!entry || entry->IsDir() || entry->GetPath().empty()) {
+			throw IOException("Distributed Paimon operation directory contains an invalid entry");
+		}
+		const auto path = entry->GetPath();
+		const auto name = FileName(path);
+		if (!IsOperationMarkerName(name)) {
+			throw IOException("Distributed Paimon operation directory contains an unknown artifact");
+		}
+		string payload;
+		status = file_system->ReadFile(path, &payload);
+		if (!status.ok()) {
+			throw IOException("Failed to read distributed Paimon operation marker: %s", status.ToString());
+		}
+		payloads.emplace_back(name, std::move(payload));
+	}
+	std::sort(payloads.begin(), payloads.end());
+	vector<PaimonDistributedInsertTransport> result;
+	for (auto &entry : payloads) {
+		auto transport = DeserializeTransport(entry.second);
+		if (entry.first != OperationMarkerName(transport) || transport.table_path != table_path ||
+		    transport.database_name != table_identifier.GetDatabaseName() ||
+		    transport.table_name != table_identifier.GetTableName()) {
+			throw InvalidInputException("Distributed Paimon operation marker does not match its table");
+		}
+		result.push_back(std::move(transport));
+	}
+	return result;
+}
+
+static void RecoverOrphanedOpenOperations(const paimon::Identifier &table_identifier, const string &table_path,
+                                          const map<string, string> &base_options) {
+	auto transports = LoadOpenOperations(table_identifier, table_path, base_options);
+	for (const auto &transport : transports) {
+		if (IsActiveOperation(transport.operation_id)) {
+			continue;
+		}
+		auto options = base_options;
+		for (const auto &option : transport.portable_options) {
+			options[option.first] = option.second;
+		}
+		PaimonDistributedRecoveryIntent abort_intent;
+		abort_intent.transport = transport;
+		abort_intent.action = PaimonDistributedRecoveryAction::ABORT;
+		auto payload = SerializeRecoveryIntent(abort_intent);
+		bool publication_may_exist = false;
+		PublishRecoveryIntent(abort_intent, payload, options, publication_may_exist);
+		CloseOperation(transport, options);
+		CleanupAttemptManifests(transport, options);
+		auto file_system = GetFileSystem(transport, options);
+		DeleteRecoveryRecords(*file_system, transport);
+	}
+}
+
 static void RecoverPendingOperations(PaimonCatalog &catalog, const paimon::Identifier &table_identifier,
                                      const string &table_path, const map<string, string> &base_options) {
 	auto records = LoadRecoveryRecords(table_identifier, table_path, base_options);
@@ -1299,12 +1408,17 @@ static void RecoverPendingOperations(PaimonCatalog &catalog, const paimon::Ident
 					                  commit_result.value());
 				}
 				PublishRecoveryCompletion(intent, record.payload, options);
+			} else {
+				// A worker can publish after the coordinator's pre-commit scan and then terminate before its
+				// post-publication marker check. Completed recovery still owns and aborts those late losers.
+				CleanupAttemptManifests(intent.transport, options, &decoded.selected_attempt_manifests, false);
 			}
 			DeleteSelectedAttemptManifests(intent.transport, options, decoded.selected_attempt_manifests);
 		}
 		auto file_system = GetFileSystem(intent.transport, options);
 		DeleteRecoveryRecords(*file_system, intent.transport);
 	}
+	RecoverOrphanedOpenOperations(table_identifier, table_path, base_options);
 }
 
 class PaimonDistributedInsertGlobalState final : public DistributedWriteGlobalState {
@@ -1795,6 +1909,13 @@ static void ValidateTargetBaseline(ClientContext &, const PhysicalPaimonInsert &
 
 PhysicalPaimonInsert::~PhysicalPaimonInsert() {
 	if (!distributed_operation_open || distributed_write_plan.worker_bind_data.empty()) {
+		UnregisterActiveOperation(distributed_operation_id);
+		return;
+	}
+	if (distributed_recovery_intent_published) {
+		// Publication may have succeeded even when its acknowledgement was lost. Preserve the full marker so the next
+		// coordinator can either consume the recovery record or safely convert an unrecorded operation to ABORT.
+		UnregisterActiveOperation(distributed_operation_id);
 		return;
 	}
 	// Vane can reject a plan before workers run and before the abort hook is armed. Closing here makes the marker's
@@ -1809,6 +1930,7 @@ PhysicalPaimonInsert::~PhysicalPaimonInsert() {
 		}
 	} catch (...) {
 	}
+	UnregisterActiveOperation(distributed_operation_id);
 }
 
 void PhysicalPaimonInsert::InitializeDistributedWrite(const vector<LogicalType> &input_types) {
@@ -1888,6 +2010,7 @@ void PhysicalPaimonInsert::InitializeDistributedWrite(const vector<LogicalType> 
 		distributed_write_plan.worker_bind_data = std::move(worker_bind_data);
 		distributed_target_initialized = true;
 		distributed_operation_open = true;
+		RegisterActiveOperation(distributed_operation_id);
 	} catch (...) {
 		(void)BestEffortCloseOperation(transport, distributed_operation_options);
 		throw;
@@ -2025,12 +2148,15 @@ idx_t PhysicalPaimonInsert::FinalizeDistributedWrite(ClientContext &context,
 			    commit_result.value());
 		}
 		// Snapshot expiry can erase the catalog's commit-user evidence. Persist the acknowledged outcome before
-		// deleting prepared artifacts so later recovery never infers failure from a missing retained snapshot.
-		PublishRecoveryCompletion(recovery_intent, recovery_payload, options);
+		// deleting prepared artifacts so later recovery never infers failure from a missing retained snapshot. A
+		// bookkeeping failure after the catalog acknowledged the commit must not turn successful INSERT rows into a
+		// user-visible failure; the pending intent and selected artifacts remain available for recovery instead.
+		auto completion_published = BestEffortPublishRecoveryCompletion(recovery_intent, recovery_payload, options);
 		// Delete recovery records only after every operation-scoped artifact is confirmed absent. A failed cleanup
 		// leaves durable completion evidence in place and does not turn a successful catalog commit into a
 		// user-visible failure.
-		if (BestEffortDeleteSelectedAttemptManifests(transport, options, decoded.selected_attempt_manifests) &&
+		if (completion_published &&
+		    BestEffortDeleteSelectedAttemptManifests(transport, options, decoded.selected_attempt_manifests) &&
 		    BestEffortDeleteRecoveryRecords(transport, options)) {
 			distributed_recovery_intent_published = false;
 		}

@@ -785,6 +785,7 @@ def exercise_unselected_attempt_artifact_cleanup(
     original_submit_tasks = backend.submit_tasks
     loser_attempt_digests: list[str] = []
     loser_handles: list[object] = []
+    orphan_operation_marker: tuple[Path, bytes] | None = None
     retry_scheduled = False
 
     def submit_with_unselected_attempt_artifact(tasks: object) -> list[object]:
@@ -808,6 +809,7 @@ def exercise_unselected_attempt_artifact_cleanup(
             original_get_result = handles[0].get_result_sync
 
             def get_result_with_unselected_retry() -> object:
+                nonlocal orphan_operation_marker
                 selected_result = original_get_result()
                 submitted_handles = list(retry_backend.submit_tasks([retry_request]))
                 require_equal(len(submitted_handles), 1, "unselected retry handle count")
@@ -822,6 +824,8 @@ def exercise_unselected_attempt_artifact_cleanup(
                     raise TimeoutError("timed out waiting for the late unselected retry to start")
                 new_open_operations = set(vane_open_operations(target_path)) - baseline_open_operations
                 require_equal(len(new_open_operations), 1, "active INSERT operation marker count")
+                marker_path = next(iter(new_open_operations))
+                orphan_operation_marker = (marker_path, marker_path.read_bytes())
                 return selected_result
 
             handles[0].get_result_sync = get_result_with_unselected_retry
@@ -914,6 +918,30 @@ def exercise_unselected_attempt_artifact_cleanup(
         baseline_open_operations,
         "successful INSERT retained operation markers",
     )
+    require_true(orphan_operation_marker is not None, "active INSERT operation marker was not captured")
+    marker_path, marker_payload = orphan_operation_marker
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_bytes(marker_payload)
+    require_equal(
+        set(vane_open_operations(target_path)),
+        baseline_open_operations | {marker_path},
+        "crashed coordinator operation marker setup",
+    )
+    empty_source = harness.connection.sql(
+        f"SELECT id, part, payload FROM paimon_scan({sql_string(multi_path)}) WHERE id < 0"
+    )
+    harness.require_write(
+        "orphan operation marker recovery",
+        lambda: empty_source.insert_into(UNSELECTED_ATTEMPT_INSERT_TARGET),
+        expected_rows=0,
+        minimum_task_results=1,
+    )
+    require_equal(
+        set(vane_open_operations(target_path)),
+        baseline_open_operations,
+        "orphan operation-marker cleanup",
+    )
+    require_equal(vane_recovery_records(target_path), [], "orphan operation recovery-record cleanup")
     require_equal(
         snapshot_count(harness.connection, target_path),
         1,
