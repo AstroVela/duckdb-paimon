@@ -50,9 +50,6 @@ public:
 	PhysicalPaimonInsert(PhysicalPlan &physical_plan, LogicalOperator &op, SchemaCatalogEntry &schema,
 	                     unique_ptr<BoundCreateTableInfo> info, paimon::Identifier table_identifier,
 	                     map<string, string> paimon_options, vector<string> part_keys, idx_t estimated_cardinality);
-#ifdef PAIMON_VANE_DISTRIBUTED
-	~PhysicalPaimonInsert() override;
-#endif
 
 	SchemaCatalogEntry *schema;
 	unique_ptr<BoundCreateTableInfo> info;
@@ -68,8 +65,6 @@ public:
 	string distributed_table_schema_json;
 	vector<LogicalType> distributed_input_types;
 	vector<string> distributed_input_names;
-	string distributed_operation_path;
-	map<string, string> distributed_operation_options;
 	map<string, string> distributed_portable_options;
 	string distributed_null_part_name;
 	int64_t distributed_schema_id = -1;
@@ -79,9 +74,6 @@ public:
 	int64_t distributed_snapshot_id = 0;
 	bool distributed_target_initialized = false;
 	bool distributed_worker_plan_selected = false;
-	mutable bool distributed_operation_open = false;
-	mutable bool distributed_recovery_intent_published = false;
-	mutable bool distributed_terminal_resolution_started = false;
 	mutable bool distributed_finalize_started = false;
 #endif
 
@@ -110,11 +102,7 @@ public:
 	                                 OperatorSourceInput &input) const override;
 
 #ifdef PAIMON_VANE_DISTRIBUTED
-	void SetVaneOperationOptions(string table_path, map<string, string> options) {
-		distributed_operation_path = std::move(table_path);
-		distributed_operation_options = std::move(options);
-	}
-	void InitializeDistributedWrite(const vector<LogicalType> &input_types);
+	void InitializeDistributedWrite(ClientContext &context, const vector<LogicalType> &input_types);
 	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override;
 	const distributed::DistributedExtensionWritePlan &WritePlan() const override;
 	void ValidateDistributedWrite(ClientContext &context) const override;

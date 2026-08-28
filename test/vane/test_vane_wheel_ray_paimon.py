@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import tempfile
@@ -39,7 +38,7 @@ FAILURE_INSERT_TARGET = "pm.vane_ray.failure_insert_target"
 CONFLICT_INSERT_TARGET = "pm.vane_ray.conflict_insert_target"
 SCHEMA_CONFLICT_INSERT_TARGET = "pm.vane_ray.schema_conflict_insert_target"
 ATTEMPT_METADATA_INSERT_TARGET = "pm.vane_ray.attempt_metadata_insert_target"
-UNSELECTED_ATTEMPT_INSERT_TARGET = "pm.vane_ray.unselected_attempt_insert_target"
+TYPE_BASELINE_INSERT_TARGET = "pm.vane_ray.type_baseline_insert_target"
 
 
 def require_equal(actual: object, expected: object, description: str) -> None:
@@ -347,11 +346,7 @@ class RayPaimonHarness:
             expected_fragments,
             f"{description} fragments",
         )
-        require_equal(
-            result.get("extension_artifact_count"),
-            expected_fragments,
-            f"{description} attempt-manifest artifacts",
-        )
+        require_equal(result.get("extension_artifact_count"), 0, f"{description} opaque artifacts")
         return result
 
 
@@ -413,7 +408,7 @@ def create_paimon_fixture(connection: object, warehouse: Path) -> tuple[Path, Pa
     connection.execute(f"CREATE TABLE {CONFLICT_INSERT_TARGET} (id INTEGER, part INTEGER, payload VARCHAR)")
     connection.execute(f"CREATE TABLE {SCHEMA_CONFLICT_INSERT_TARGET} (id INTEGER, part INTEGER, payload VARCHAR)")
     connection.execute(f"CREATE TABLE {ATTEMPT_METADATA_INSERT_TARGET} (id INTEGER, part INTEGER, payload VARCHAR)")
-    connection.execute(f"CREATE TABLE {UNSELECTED_ATTEMPT_INSERT_TARGET} (id INTEGER, part INTEGER, payload VARCHAR)")
+    connection.execute(f"CREATE TABLE {TYPE_BASELINE_INSERT_TARGET} (id INTEGER, part INTEGER, payload VARCHAR)")
 
     multi_path = warehouse / "vane_ray.db/multi_split"
     empty_path = warehouse / "vane_ray.db/empty_table"
@@ -429,7 +424,7 @@ def create_paimon_fixture(connection: object, warehouse: Path) -> tuple[Path, Pa
         CONFLICT_INSERT_TARGET: warehouse / "vane_ray.db/conflict_insert_target",
         SCHEMA_CONFLICT_INSERT_TARGET: warehouse / "vane_ray.db/schema_conflict_insert_target",
         ATTEMPT_METADATA_INSERT_TARGET: warehouse / "vane_ray.db/attempt_metadata_insert_target",
-        UNSELECTED_ATTEMPT_INSERT_TARGET: warehouse / "vane_ray.db/unselected_attempt_insert_target",
+        TYPE_BASELINE_INSERT_TARGET: warehouse / "vane_ray.db/type_baseline_insert_target",
     }
     return (
         multi_path,
@@ -544,27 +539,6 @@ def snapshot_count(connection: object, table_path: Path) -> int:
 
 def vane_attempt_artifacts(table_path: Path) -> list[Path]:
     return sorted(path for path in table_path.rglob("vane_*") if path.is_file())
-
-
-def vane_attempt_manifests(table_path: Path) -> list[Path]:
-    manifest_root = table_path / ".vane/paimon"
-    if not manifest_root.exists():
-        return []
-    return sorted(path for path in manifest_root.rglob("*.commit") if path.is_file())
-
-
-def vane_open_operations(table_path: Path) -> list[Path]:
-    operation_root = table_path / ".vane/paimon/operations"
-    if not operation_root.exists():
-        return []
-    return sorted(path for path in operation_root.rglob("*.open") if path.is_file())
-
-
-def vane_recovery_records(table_path: Path) -> list[Path]:
-    recovery_root = table_path / ".vane/paimon/recovery"
-    if not recovery_root.exists():
-        return []
-    return sorted(path for path in recovery_root.rglob("*") if path.is_file())
 
 
 def table_file_inventory(table_path: Path) -> list[Path]:
@@ -747,213 +721,6 @@ def exercise_duplicate_retry_attempt_metadata(
     )
 
 
-def exercise_unselected_attempt_artifact_cleanup(
-    harness: RayPaimonHarness,
-    multi_path: Path,
-    target_path: Path,
-) -> None:
-    from vane.runners.fte import FteTaskAttemptId
-    from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
-    from vane.runners.local.runner import _InProcessFragmentExecutor
-
-    baseline_open_operations = set(vane_open_operations(target_path))
-    logical_plan = harness.capture_write_plan(
-        lambda: source_insert_relation(harness, multi_path).insert_into(UNSELECTED_ATTEMPT_INSERT_TARGET)
-    )
-    physical_plan = logical_plan.to_physical_plan(harness.connection)
-    executor = _InProcessFragmentExecutor()
-    backend = NativeFteWorkerManagerBackend(
-        execute_fn=executor,
-        num_workers=WORKER_COUNT,
-        max_running_tasks=WORKER_COUNT,
-    )
-    retry_executor = _InProcessFragmentExecutor()
-    retry_started = threading.Event()
-    retry_release = threading.Event()
-
-    def execute_late_retry(request: object) -> object:
-        retry_started.set()
-        if not retry_release.wait(timeout=120):
-            raise TimeoutError("timed out waiting to release the late unselected retry")
-        return retry_executor(request)
-
-    retry_backend = NativeFteWorkerManagerBackend(
-        execute_fn=execute_late_retry,
-        num_workers=1,
-        max_running_tasks=1,
-    )
-    original_submit_tasks = backend.submit_tasks
-    loser_attempt_digests: list[str] = []
-    loser_handles: list[object] = []
-    orphan_operation_marker: tuple[Path, bytes] | None = None
-    retry_scheduled = False
-
-    def submit_with_unselected_attempt_artifact(tasks: object) -> list[object]:
-        nonlocal retry_scheduled
-        task_list = list(tasks)
-        handles = list(original_submit_tasks(task_list))
-        if task_list and handles and not retry_scheduled:
-            retry_scheduled = True
-            retry_request = backend._request_from_task(task_list[0])
-            selected_id = FteTaskAttemptId.coerce(retry_request["task_id"])
-            retry_id = FteTaskAttemptId(selected_id.task_id, selected_id.attempt_id + 1)
-            retry_request["task_id"] = retry_id.to_dict()
-            retry_context = dict(retry_request.get("context") or {})
-            retry_context["attempt_id"] = str(retry_id.attempt_id)
-            retry_request["context"] = retry_context
-            digest = hashlib.md5()
-            digest.update(retry_id.query_id.encode())
-            digest.update(b"\0")
-            digest.update(str(retry_id).encode())
-            loser_attempt_digests.append(digest.hexdigest())
-            original_get_result = handles[0].get_result_sync
-
-            def get_result_with_unselected_retry() -> object:
-                nonlocal orphan_operation_marker
-                selected_result = original_get_result()
-                submitted_handles = list(retry_backend.submit_tasks([retry_request]))
-                require_equal(len(submitted_handles), 1, "unselected retry handle count")
-                loser_handles.extend(submitted_handles)
-                source_node_ids = list(retry_request.get("source_node_ids") or [])
-                if source_node_ids:
-                    retry_backend.task_input_stream_exhausted(retry_id.query_id, source_node_ids)
-                # Register a genuine retry before the coordinator sees the selected result, but keep its execution
-                # blocked. Releasing it only after run_copy_plan returns forces it to finish after the coordinator's
-                # manifest scan and catalog commit.
-                if not retry_started.wait(timeout=WORKER_PLAN_CAPTURE_TIMEOUT_SECONDS):
-                    raise TimeoutError("timed out waiting for the late unselected retry to start")
-                new_open_operations = set(vane_open_operations(target_path)) - baseline_open_operations
-                require_equal(len(new_open_operations), 1, "active INSERT operation marker count")
-                marker_path = next(iter(new_open_operations))
-                orphan_operation_marker = (marker_path, marker_path.read_bytes())
-                return selected_result
-
-            handles[0].get_result_sync = get_result_with_unselected_retry
-        return handles
-
-    backend.submit_tasks = submit_with_unselected_attempt_artifact
-    plan_runner = harness.vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
-    blocked_directory = target_path / "unrelated/blocked"
-    blocked_directory.mkdir(parents=True)
-    blocked_directory.chmod(0)
-    try:
-        result = plan_runner.run_copy_plan(physical_plan, harness.connection)
-        require_equal(
-            result.get("extension_write"),
-            True,
-            "unselected attempt extension write marker",
-        )
-        require_equal(
-            result.get("extension_catalog_committed"),
-            True,
-            "unselected attempt catalog commit",
-        )
-        require_equal(result.get("rows_copied"), 80, "unselected attempt affected rows")
-        require_true(
-            int(result.get("extension_task_result_count") or 0) >= WORKER_COUNT,
-            "unselected attempt cleanup did not select enough worker tasks",
-        )
-        require_equal(
-            set(vane_open_operations(target_path)),
-            baseline_open_operations,
-            "committed INSERT operation-marker cleanup",
-        )
-        retry_release.set()
-        require_equal(len(loser_handles), 1, "late unselected retry handle count")
-        loser_handle = loser_handles[0]
-        deadline = time.monotonic() + WORKER_PLAN_CAPTURE_TIMEOUT_SECONDS
-        while not loser_handle.done():
-            if time.monotonic() >= deadline:
-                raise TimeoutError("timed out waiting for the late unselected retry attempt")
-            time.sleep(0.01)
-        late_retry_error: BaseException | None = None
-        try:
-            loser_handle.get_result_sync()
-        except BaseException as error:
-            late_retry_error = error
-        finally:
-            try:
-                loser_handle.ack()
-            finally:
-                loser_handle.release_result_payload()
-        require_true(late_retry_error is not None, "late unselected retry unexpectedly succeeded")
-        if not error_chain_contains(late_retry_error, "operation is closed"):
-            raise AssertionError(
-                f"late unselected retry returned the wrong error: {late_retry_error!r}"
-            ) from late_retry_error
-    finally:
-        retry_release.set()
-        try:
-            blocked_directory.chmod(0o755)
-        finally:
-            try:
-                backend.shutdown()
-            finally:
-                try:
-                    retry_backend.shutdown()
-                finally:
-                    try:
-                        executor.close()
-                    finally:
-                        retry_executor.close()
-
-    require_true(bool(loser_attempt_digests), "unselected retry attempt did not run")
-    remaining_loser_artifacts = [
-        path
-        for path in vane_attempt_artifacts(target_path)
-        if any(digest in path.name for digest in loser_attempt_digests)
-    ]
-    require_equal(
-        remaining_loser_artifacts,
-        [],
-        "unselected retry attempt data/index cleanup",
-    )
-    require_equal(
-        vane_attempt_manifests(target_path),
-        [],
-        "successful INSERT attempt-manifest cleanup",
-    )
-    require_equal(
-        set(vane_open_operations(target_path)),
-        baseline_open_operations,
-        "successful INSERT retained operation markers",
-    )
-    require_true(orphan_operation_marker is not None, "active INSERT operation marker was not captured")
-    marker_path, marker_payload = orphan_operation_marker
-    marker_path.parent.mkdir(parents=True, exist_ok=True)
-    marker_path.write_bytes(marker_payload)
-    require_equal(
-        set(vane_open_operations(target_path)),
-        baseline_open_operations | {marker_path},
-        "crashed coordinator operation marker setup",
-    )
-    empty_source = harness.connection.sql(
-        f"SELECT id, part, payload FROM paimon_scan({sql_string(multi_path)}) WHERE id < 0"
-    )
-    harness.require_write(
-        "orphan operation marker recovery",
-        lambda: empty_source.insert_into(UNSELECTED_ATTEMPT_INSERT_TARGET),
-        expected_rows=0,
-        minimum_task_results=1,
-    )
-    require_equal(
-        set(vane_open_operations(target_path)),
-        baseline_open_operations,
-        "orphan operation-marker cleanup",
-    )
-    require_equal(vane_recovery_records(target_path), [], "orphan operation recovery-record cleanup")
-    require_equal(
-        snapshot_count(harness.connection, target_path),
-        1,
-        "unselected attempt snapshot count",
-    )
-    harness.require_query(
-        f"SELECT count(*)::BIGINT, sum(id)::BIGINT FROM {UNSELECTED_ATTEMPT_INSERT_TARGET}",
-        [(80, 3160)],
-        "unselected attempt committed result",
-    )
-
-
 def exercise_worker_failure_and_retry(
     harness: RayPaimonHarness,
     multi_path: Path,
@@ -961,7 +728,6 @@ def exercise_worker_failure_and_retry(
 ) -> None:
     vane = harness.vane
     baseline_files = table_file_inventory(target_path)
-    baseline_open_operations = set(vane_open_operations(target_path))
     relation = source_insert_relation(harness, multi_path).map_batches(
         FailSelectedPaimonWorker,
         schema={
@@ -987,12 +753,18 @@ def exercise_worker_failure_and_retry(
         0,
         "worker failure snapshot cleanup",
     )
-    require_equal(vane_attempt_artifacts(target_path), [], "worker failure artifact cleanup")
-    require_equal(table_file_inventory(target_path), baseline_files, "worker failure file cleanup")
+    # The failed exchange cannot publish the successful workers' commit
+    # envelopes to the coordinator, so there are no materialized
+    # CommitMessages that the extension can safely abort. Match Iceberg's
+    # execution contract: fail the operation, leave the prepared files for
+    # Paimon's orphan-files GC, and do not publish a snapshot.
+    retained_artifacts = vane_attempt_artifacts(target_path)
+    require_true(bool(retained_artifacts), "worker failure did not retain prepared artifacts")
+    expected_inventory = sorted(baseline_files + [artifact.relative_to(target_path) for artifact in retained_artifacts])
     require_equal(
-        set(vane_open_operations(target_path)),
-        baseline_open_operations,
-        "failed INSERT operation-marker cleanup",
+        table_file_inventory(target_path),
+        expected_inventory,
+        "worker failure retained only prepared artifacts",
     )
 
     harness.require_write(
@@ -1010,11 +782,6 @@ def exercise_worker_failure_and_retry(
         harness.connection.execute(f"SELECT count(*)::BIGINT, sum(id)::BIGINT FROM {FAILURE_INSERT_TARGET}").fetchone(),
         (80, 3160),
         "worker retry result",
-    )
-    require_equal(
-        set(vane_open_operations(target_path)),
-        baseline_open_operations,
-        "retried INSERT operation-marker cleanup",
     )
 
 
@@ -1107,10 +874,7 @@ def exercise_target_conflict_and_retry(
         try:
             verify_extension_is_wheel_linked(mutation_connection)
             warehouse = target_path.parent.parent
-            # Use a lexically different spelling of the coordinator warehouse so this conflict also exercises the
-            # canonical cross-ATTACH mutation-lock identity.
-            warehouse_alias = warehouse / "vane_ray.db/.."
-            mutation_connection.execute(f"ATTACH {sql_string(warehouse_alias)} AS conflict_pm (TYPE paimon)")
+            mutation_connection.execute(f"ATTACH {sql_string(warehouse)} AS conflict_pm (TYPE paimon)")
             mutation_connection.execute(
                 "INSERT INTO conflict_pm.vane_ray.conflict_insert_target VALUES (-1, 99, 'conflict')"
             )
@@ -1214,6 +978,44 @@ def exercise_schema_conflict_and_retry(
         (80, 3160),
         "schema conflict retry result",
     )
+
+
+def exercise_exact_type_baseline(
+    harness: RayPaimonHarness,
+    multi_path: Path,
+    target_path: Path,
+) -> None:
+    # Keep DuckDB's table entry at the CREATE-time INTEGER type, then publish an
+    # equivalent-width Paimon schema whose first field is BIGINT. Distributed
+    # planning must compare against the freshly loaded physical field types.
+    schema_directory = target_path / "schema"
+    schema = json.loads((schema_directory / "schema-0").read_text(encoding="utf-8"))
+    schema["id"] = 1
+    schema["timeMillis"] = int(schema["timeMillis"]) + 1
+    schema["fields"][0]["type"] = "BIGINT"
+    temporary_path = schema_directory / f".schema-1-{uuid.uuid4().hex}"
+    temporary_path.write_text(json.dumps(schema, indent=4) + "\n", encoding="utf-8")
+    temporary_path.replace(schema_directory / "schema-1")
+
+    previous_count = harness.write_dispatch_count
+    require_error(
+        "distributed Paimon exact type baseline",
+        lambda: source_insert_relation(harness, multi_path).insert_into(TYPE_BASELINE_INSERT_TARGET),
+        "input schema does not match the current target table types",
+    )
+    # The harness increments this counter on entry to run_write, before Vane
+    # performs coordinator validation and before it submits any Ray tasks.
+    require_equal(
+        harness.write_dispatch_count,
+        previous_count + 1,
+        "type baseline coordinator validation",
+    )
+    require_equal(
+        snapshot_count(harness.connection, target_path),
+        0,
+        "type baseline snapshot count",
+    )
+    require_equal(vane_attempt_artifacts(target_path), [], "type baseline artifacts")
 
 
 def exercise_fail_closed_payloads(harness: RayPaimonHarness, multi_path: Path) -> None:
@@ -1331,11 +1133,6 @@ def main() -> None:
                 multi_path,
                 target_paths[ATTEMPT_METADATA_INSERT_TARGET],
             )
-            exercise_unselected_attempt_artifact_cleanup(
-                harness,
-                multi_path,
-                target_paths[UNSELECTED_ATTEMPT_INSERT_TARGET],
-            )
             exercise_worker_failure_and_retry(
                 harness,
                 multi_path,
@@ -1351,10 +1148,11 @@ def main() -> None:
                 multi_path,
                 target_paths[SCHEMA_CONFLICT_INSERT_TARGET],
             )
-            for target, target_path in target_paths.items():
-                require_equal(vane_open_operations(target_path), [], f"{target} retained operation markers")
-                require_equal(vane_attempt_manifests(target_path), [], f"{target} retained attempt manifests")
-                require_equal(vane_recovery_records(target_path), [], f"{target} retained recovery records")
+            exercise_exact_type_baseline(
+                harness,
+                multi_path,
+                target_paths[TYPE_BASELINE_INSERT_TARGET],
+            )
             require_true(
                 harness.read_dispatch_count >= 9,
                 "Ray suite did not exercise enough reads",

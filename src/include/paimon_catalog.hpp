@@ -33,12 +33,6 @@
 
 #include "paimon_schema_set.hpp"
 
-#ifdef PAIMON_VANE_DISTRIBUTED
-#include "duckdb/common/shared_ptr.hpp"
-
-#include <mutex>
-#endif
-
 namespace duckdb {
 
 class PaimonCatalog : public Catalog {
@@ -103,13 +97,6 @@ public:
 		return access_mode;
 	}
 
-#ifdef PAIMON_VANE_DISTRIBUTED
-	shared_ptr<std::mutex> GetVaneCatalogMutationMutex() const;
-	const string &GetVaneWarehouseIdentity() const {
-		return vane_warehouse_identity;
-	}
-#endif
-
 	const string &GetPath() const {
 		return path;
 	}
@@ -120,9 +107,6 @@ private:
 	unordered_map<string, Value> attached_options;
 	unique_ptr<paimon::Catalog> paimon_catalog;
 	PaimonSchemaSet schemas;
-#ifdef PAIMON_VANE_DISTRIBUTED
-	string vane_warehouse_identity;
-#endif
 
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 };

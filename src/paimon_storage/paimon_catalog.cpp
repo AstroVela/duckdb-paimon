@@ -26,10 +26,6 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
-#ifdef PAIMON_VANE_DISTRIBUTED
-#include "duckdb/common/file_system.hpp"
-#include "duckdb/common/path.hpp"
-#endif
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
@@ -58,30 +54,6 @@ namespace duckdb {
 
 static constexpr const char *S3_PATH_PREFIX = "s3://";
 static constexpr const char *OSS_PATH_PREFIX = "oss://";
-
-#ifdef PAIMON_VANE_DISTRIBUTED
-static string CanonicalVaneWarehouseIdentity(ClientContext &context, const string &path) {
-	auto parsed_path = Path::FromString(path);
-	if (parsed_path.IsRemote()) {
-		return parsed_path.ToString();
-	}
-	return FileSystem::GetFileSystem(context).CanonicalizePath(path);
-}
-
-shared_ptr<std::mutex> PaimonCatalog::GetVaneCatalogMutationMutex() const {
-	// Vane hosts the DuckDB sessions that participate in this extension-write protocol in one process. Independently
-	// managed processes require metastore-level coordination and are outside this in-process mutation contract.
-	static std::mutex registry_mutex;
-	static unordered_map<string, weak_ptr<std::mutex>> registry;
-	std::lock_guard<std::mutex> guard(registry_mutex);
-	auto result = registry[vane_warehouse_identity].lock();
-	if (!result) {
-		result = make_shared_ptr<std::mutex>();
-		registry[vane_warehouse_identity] = result;
-	}
-	return result;
-}
-#endif
 
 static std::optional<string> TryGetPaimonOptionValue(const unordered_map<string, Value> &input_options,
                                                      const string &key) {
@@ -264,9 +236,6 @@ PaimonCatalog::PaimonCatalog(ClientContext &context, AttachedDatabase &db, const
                              const unordered_map<string, Value> &attach_options, AccessMode access_mode)
     : Catalog(db), path(path), access_mode(access_mode), attached_options(attach_options),
       paimon_catalog(CreatePaimonCatalog(context, path, attach_options)), schemas(*this) {
-#ifdef PAIMON_VANE_DISTRIBUTED
-	vane_warehouse_identity = CanonicalVaneWarehouseIdentity(context, path);
-#endif
 }
 
 unique_ptr<Catalog> PaimonCatalog::Attach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
@@ -296,10 +265,6 @@ string PaimonCatalog::GetCatalogType() {
 }
 
 optional_ptr<CatalogEntry> PaimonCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
-#ifdef PAIMON_VANE_DISTRIBUTED
-	auto vane_mutex = GetVaneCatalogMutationMutex();
-	std::lock_guard<std::mutex> vane_guard(*vane_mutex);
-#endif
 	bool ignore_if_exists = info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT;
 	auto status = paimon_catalog->CreateDatabase(info.schema, {}, ignore_if_exists);
 	if (!status.ok()) {
@@ -381,24 +346,16 @@ PhysicalOperator &PaimonCatalog::PlanInsert(ClientContext &context, PhysicalPlan
 		plan = planner.ResolveDefaultsProjection(op, *plan);
 	}
 
-#ifdef PAIMON_VANE_DISTRIBUTED
-	auto distributed_table_path_result = paimon_catalog->GetTableLocation(table_identifier);
-	if (!distributed_table_path_result.ok()) {
-		throw IOException(distributed_table_path_result.status().ToString());
-	}
-	auto distributed_table_path = std::move(distributed_table_path_result).value();
-	const unordered_map<string, Value> distributed_local_options;
-	auto distributed_operation_options = GetPaimonOptions(context, distributed_table_path, distributed_local_options);
-#endif
 	auto &insert = planner.Make<PhysicalPaimonInsert>(op, table.schema, nullptr, std::move(table_identifier),
 	                                                  std::move(paimon_options), std::move(part_keys), 0U);
-#ifdef PAIMON_VANE_DISTRIBUTED
-	insert.Cast<PhysicalPaimonInsert>().SetVaneOperationOptions(std::move(distributed_table_path),
-	                                                            std::move(distributed_operation_options));
-#endif
 	if (plan) {
 		insert.children.push_back(*plan);
 	}
+#ifdef PAIMON_VANE_DISTRIBUTED
+	if (plan) {
+		insert.Cast<PhysicalPaimonInsert>().InitializeDistributedWrite(context, insert.children[0].get().types);
+	}
+#endif
 	return insert;
 }
 
@@ -426,10 +383,6 @@ ErrorData PaimonCatalog::SupportsCreateTable(BoundCreateTableInfo &info) {
 }
 
 void PaimonCatalog::DropSchema(ClientContext &context, DropInfo &info) {
-#ifdef PAIMON_VANE_DISTRIBUTED
-	auto vane_mutex = GetVaneCatalogMutationMutex();
-	std::lock_guard<std::mutex> vane_guard(*vane_mutex);
-#endif
 	bool ignore_if_not_exists = info.if_not_found == OnEntryNotFound::RETURN_NULL;
 	auto status = paimon_catalog->DropDatabase(info.name, ignore_if_not_exists, info.cascade);
 	if (!status.ok()) {
