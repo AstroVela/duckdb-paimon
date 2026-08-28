@@ -60,6 +60,7 @@ public:
 #ifdef PAIMON_VANE_DISTRIBUTED
 	distributed::DistributedExtensionWritePlan distributed_write_plan;
 	string distributed_operation_id;
+	string distributed_warehouse_path;
 	string distributed_table_uuid;
 	string distributed_table_path;
 	string distributed_table_schema_json;

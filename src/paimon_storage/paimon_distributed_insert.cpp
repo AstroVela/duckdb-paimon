@@ -73,10 +73,13 @@ static constexpr const char *PAIMON_DISTRIBUTED_INSERT_FRAGMENT_CODEC = "paimon.
 static constexpr const char *PAIMON_DISTRIBUTED_ATTEMPT_MANIFEST_ARTIFACT = "paimon_attempt_manifest";
 static constexpr const char *PAIMON_DISTRIBUTED_ATTEMPT_MANIFEST_CODEC = "paimon.append-attempt-manifest";
 static constexpr const char *PAIMON_DISTRIBUTED_ATTEMPT_MANIFEST_SUFFIX = ".commit";
+static constexpr const char *PAIMON_DISTRIBUTED_OPERATION_FENCE_DIRECTORY = "fences";
+static constexpr const char *PAIMON_DISTRIBUTED_OPERATION_FENCE_SUFFIX = ".closed";
 static constexpr idx_t PAIMON_DISTRIBUTED_ATTEMPT_DIGEST_SIZE = 32;
 
 struct PaimonDistributedInsertTransport {
 	string operation_id;
+	string warehouse_path;
 	string database_name;
 	string table_name;
 	string table_uuid;
@@ -177,6 +180,15 @@ static string SchemaFingerprint(const string &schema_json) {
 	return context.FinishHex();
 }
 
+static string TableIdentityDigest(const PaimonDistributedInsertTransport &transport) {
+	MD5Context context;
+	context.Add(transport.table_uuid);
+	const data_t separator = 0;
+	context.Add(&separator, 1);
+	context.Add(transport.table_path);
+	return context.FinishHex();
+}
+
 static string CompactUUID(const string &uuid) {
 	string result;
 	result.reserve(uuid.size());
@@ -230,6 +242,13 @@ static string AttemptManifestPath(const PaimonDistributedInsertTransport &transp
 	return JoinPath(OperationAttemptManifestDirectory(transport), AttemptManifestName(task));
 }
 
+static string OperationFencePath(const PaimonDistributedInsertTransport &transport) {
+	const auto fence_root =
+	    JoinPath(transport.warehouse_path, ".vane/paimon/" + string(PAIMON_DISTRIBUTED_OPERATION_FENCE_DIRECTORY));
+	const auto directory = JoinPath(fence_root, TableIdentityDigest(transport));
+	return JoinPath(directory, CompactUUID(transport.operation_id) + PAIMON_DISTRIBUTED_OPERATION_FENCE_SUFFIX);
+}
+
 static string ExpectedFragmentId(const PaimonDistributedInsertTransport &transport, const string &task_attempt_id) {
 	return transport.operation_id + ":" + task_attempt_id;
 }
@@ -259,9 +278,10 @@ static map<string, string> GetPortableWriteOptions(const map<string, string> &op
 }
 
 static void ValidateTransport(const PaimonDistributedInsertTransport &transport) {
-	if (!IsCanonicalUUID(transport.operation_id) || transport.database_name.empty() || transport.table_name.empty() ||
-	    transport.table_uuid.empty() || transport.table_path.empty() || transport.table_schema_json.empty() ||
-	    transport.schema_id < 0 || transport.commit_identifier <= 0 || transport.input_types.empty() ||
+	if (!IsCanonicalUUID(transport.operation_id) || transport.warehouse_path.empty() ||
+	    transport.database_name.empty() || transport.table_name.empty() || transport.table_uuid.empty() ||
+	    transport.table_path.empty() || transport.table_schema_json.empty() || transport.schema_id < 0 ||
+	    transport.commit_identifier <= 0 || transport.input_types.empty() ||
 	    transport.input_types.size() != transport.input_names.size() || transport.null_part_name.empty()) {
 		throw SerializationException("Distributed Paimon INSERT bind has incomplete target state");
 	}
@@ -310,6 +330,7 @@ static void SerializeTransport(Serializer &serializer, const PaimonDistributedIn
 	serializer.WriteProperty(15, "portable_options", transport.portable_options);
 	serializer.WriteProperty(16, "append_only", transport.append_only);
 	serializer.WriteProperty(17, "table_uuid", transport.table_uuid);
+	serializer.WriteProperty(18, "warehouse_path", transport.warehouse_path);
 }
 
 static string SerializeTransport(const PaimonDistributedInsertTransport &transport) {
@@ -351,6 +372,7 @@ static PaimonDistributedInsertTransport DeserializeTransport(const string &bytes
 	result.portable_options = deserializer.ReadProperty<map<string, string>>(15, "portable_options");
 	result.append_only = deserializer.ReadProperty<bool>(16, "append_only");
 	result.table_uuid = deserializer.ReadProperty<string>(17, "table_uuid");
+	result.warehouse_path = deserializer.ReadProperty<string>(18, "warehouse_path");
 	deserializer.End();
 	ValidateTransport(result);
 	return result;
@@ -572,6 +594,68 @@ static std::unique_ptr<paimon::FileSystem> GetFileSystem(const PaimonDistributed
 	return std::move(file_system_result).value();
 }
 
+static string SerializeOperationFence(const PaimonDistributedInsertTransport &transport) {
+	MemoryStream stream(Allocator::DefaultAllocator());
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	serializer.WriteProperty(1, "protocol_version", PAIMON_DISTRIBUTED_INSERT_PROTOCOL_VERSION);
+	serializer.WriteProperty(2, "operation_id", transport.operation_id);
+	serializer.WriteProperty(3, "warehouse_path", transport.warehouse_path);
+	serializer.WriteProperty(4, "table_uuid", transport.table_uuid);
+	serializer.WriteProperty(5, "table_path", transport.table_path);
+	serializer.End();
+	return string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
+}
+
+static bool OperationIsFenced(paimon::FileSystem &file_system, const PaimonDistributedInsertTransport &transport) {
+	const auto path = OperationFencePath(transport);
+	auto exists_result = file_system.Exists(path);
+	if (!exists_result.ok()) {
+		throw IOException("Failed to inspect distributed Paimon operation fence: %s",
+		                  exists_result.status().ToString());
+	}
+	if (!exists_result.value()) {
+		return false;
+	}
+	string payload;
+	auto status = file_system.ReadFile(path, &payload);
+	if (!status.ok()) {
+		throw IOException("Failed to read distributed Paimon operation fence: %s", status.ToString());
+	}
+	if (payload != SerializeOperationFence(transport)) {
+		throw InvalidInputException("Distributed Paimon INSERT operation fence does not match its target");
+	}
+	return true;
+}
+
+static void FenceOperation(const PaimonDistributedInsertTransport &transport, const map<string, string> &options) {
+	auto file_system = GetFileSystem(transport, options);
+	const auto path = OperationFencePath(transport);
+	auto status = file_system->AtomicStore(path, SerializeOperationFence(transport));
+	if (status.ok() || OperationIsFenced(*file_system, transport)) {
+		return;
+	}
+	throw IOException("Failed to publish distributed Paimon operation fence: %s", status.ToString());
+}
+
+static void BestEffortFenceOperation(const PaimonDistributedInsertTransport &transport,
+                                     const map<string, string> &options) noexcept {
+	try {
+		FenceOperation(transport, options);
+	} catch (...) {
+	}
+}
+
+static void BestEffortDeleteAttemptManifest(paimon::FileSystem &file_system,
+                                            const PaimonDistributedInsertTransport &transport,
+                                            const DistributedWriteTaskContext &task) noexcept {
+	try {
+		(void)file_system.Delete(AttemptManifestPath(transport, task), false);
+		(void)file_system.Delete(OperationAttemptManifestDirectory(transport), false);
+	} catch (...) {
+	}
+}
+
 static bool IsAttemptManifestName(const string &name) {
 	const string suffix = PAIMON_DISTRIBUTED_ATTEMPT_MANIFEST_SUFFIX;
 	if (name.size() != PAIMON_DISTRIBUTED_ATTEMPT_DIGEST_SIZE + suffix.size() ||
@@ -627,13 +711,44 @@ DeserializeManifestMessages(const PaimonDistributedCommitEnvelope &envelope) {
 	return messages;
 }
 
+static void AbortAndRetractAttemptManifest(paimon::FileSystem &file_system,
+                                           const PaimonDistributedInsertTransport &transport,
+                                           const map<string, string> &options, const DistributedWriteTaskContext &task,
+                                           const string &commit_user,
+                                           std::vector<std::shared_ptr<paimon::CommitMessage>> &messages) {
+	AbortMessages(transport, options, commit_user, messages);
+	messages.clear();
+	BestEffortDeleteAttemptManifest(file_system, transport, task);
+}
+
 static void WriteAttemptManifest(const PaimonDistributedInsertTransport &transport, const map<string, string> &options,
-                                 const DistributedWriteTaskContext &task, const string &payload) {
+                                 const DistributedWriteTaskContext &task, const string &commit_user,
+                                 std::vector<std::shared_ptr<paimon::CommitMessage>> &messages, const string &payload) {
 	auto file_system = GetFileSystem(transport, options);
+	if (OperationIsFenced(*file_system, transport)) {
+		AbortMessages(transport, options, commit_user, messages);
+		messages.clear();
+		throw TransactionException("Distributed Paimon INSERT operation is fenced");
+	}
 	const auto path = AttemptManifestPath(transport, task);
 	auto status = file_system->AtomicStore(path, payload);
 	if (!status.ok()) {
 		throw IOException("Failed to publish distributed Paimon attempt manifest: %s", status.ToString());
+	}
+	bool fenced = false;
+	try {
+		fenced = OperationIsFenced(*file_system, transport);
+	} catch (...) {
+		auto fence_error = std::current_exception();
+		try {
+			AbortAndRetractAttemptManifest(*file_system, transport, options, task, commit_user, messages);
+		} catch (...) {
+		}
+		std::rethrow_exception(fence_error);
+	}
+	if (fenced) {
+		AbortAndRetractAttemptManifest(*file_system, transport, options, task, commit_user, messages);
+		throw TransactionException("Distributed Paimon INSERT operation is fenced while publishing an attempt");
 	}
 }
 
@@ -669,23 +784,32 @@ static void CleanupAttemptManifests(const PaimonDistributedInsertTransport &tran
 		if (!IsAttemptManifestName(name)) {
 			throw IOException("Distributed Paimon attempt-manifest directory contains an unknown artifact");
 		}
+		optional_ptr<const string> retained_payload;
+		if (retained_manifests) {
+			auto retained = retained_manifests->find(name);
+			if (retained != retained_manifests->end()) {
+				retained_payload = retained->second;
+			}
+		}
 		string payload;
 		status = file_system->ReadFile(path, &payload);
 		if (!status.ok()) {
+			// Once the operation fence is visible, an unselected worker may abort its messages and retract its own
+			// manifest between this ListDir result and ReadFile. A selected manifest must remain byte-verifiable.
+			if (status.IsNotExist() && !retained_payload) {
+				continue;
+			}
 			throw IOException("Failed to read distributed Paimon attempt manifest: %s", status.ToString());
 		}
 		auto envelope = DeserializeCommitEnvelope(payload);
 		ValidateAttemptManifestEnvelope(transport, envelope, name);
-		if (retained_manifests) {
-			auto retained = retained_manifests->find(name);
-			if (retained != retained_manifests->end()) {
-				if (*retained->second != payload) {
-					throw InvalidInputException(
-					    "Distributed Paimon INSERT selected result does not match its published attempt manifest");
-				}
-				retained_found.insert(name);
-				continue;
+		if (retained_payload) {
+			if (*retained_payload != payload) {
+				throw InvalidInputException(
+				    "Distributed Paimon INSERT selected result does not match its published attempt manifest");
 			}
+			retained_found.insert(name);
+			continue;
 		}
 		auto messages = DeserializeManifestMessages(envelope);
 		AbortMessages(transport, options, envelope.writer_commit_user, messages);
@@ -1016,7 +1140,8 @@ static vector<DistributedWriteFragment> PaimonDistributedInsertFinalize(ClientCo
 	// Publish recovery metadata only after the complete task envelope is immutable. The manifest assumes ownership of
 	// cleanup when Vane discards a successful retry/speculative result; until publication succeeds, the global-state
 	// destructor remains armed and aborts every prepared data/index file.
-	WriteAttemptManifest(global.transport, global.options, task, fragments[0].payload);
+	WriteAttemptManifest(global.transport, global.options, task, global.writer_commit_user, global.messages,
+	                     fragments[0].payload);
 	global.messages.clear();
 	return fragments;
 }
@@ -1150,6 +1275,7 @@ static void DecodeCommitResults(const DistributedExtensionWriteInfo &info,
 static PaimonDistributedInsertTransport GetCoordinatorTransport(const PhysicalPaimonInsert &insert) {
 	auto transport = DeserializeTransport(insert.distributed_write_plan.worker_bind_data);
 	if (transport.operation_id != insert.distributed_operation_id ||
+	    transport.warehouse_path != insert.distributed_warehouse_path ||
 	    transport.database_name != insert.table_identifier.GetDatabaseName() ||
 	    transport.table_name != insert.table_identifier.GetTableName() ||
 	    transport.table_uuid != insert.distributed_table_uuid ||
@@ -1245,6 +1371,7 @@ void PhysicalPaimonInsert::InitializeDistributedWrite(const vector<LogicalType> 
 	}
 	distributed_operation_id = UUID::ToString(UUID::GenerateRandomUUID());
 	distributed_commit_identifier = CreateCommitIdentifier(distributed_operation_id);
+	distributed_warehouse_path = catalog.GetPath();
 	distributed_table_uuid = std::move(target.table_uuid);
 	distributed_table_path = std::move(target.table_path);
 	distributed_table_schema_json = std::move(target.table_schema_json);
@@ -1259,6 +1386,7 @@ void PhysicalPaimonInsert::InitializeDistributedWrite(const vector<LogicalType> 
 
 	PaimonDistributedInsertTransport transport;
 	transport.operation_id = distributed_operation_id;
+	transport.warehouse_path = distributed_warehouse_path;
 	transport.database_name = table_identifier.GetDatabaseName();
 	transport.table_name = table_identifier.GetTableName();
 	transport.table_uuid = distributed_table_uuid;
@@ -1319,13 +1447,21 @@ idx_t PhysicalPaimonInsert::FinalizeDistributedWrite(ClientContext &context,
 	try {
 		options = BuildRuntimeOptions(context, transport);
 	} catch (...) {
+		BestEffortFenceOperation(transport, paimon_options);
 		BestEffortCleanupAttemptManifests(transport, paimon_options);
+		throw;
+	}
+	try {
+		// Closing the operation before enumerating manifests prevents attempts that finish after the scan from
+		// transferring cleanup ownership to the coordinator. Workers check this persistent fence around publication.
+		FenceOperation(transport, options);
+	} catch (...) {
+		BestEffortFenceOperation(transport, options);
+		BestEffortCleanupAttemptManifests(transport, options);
 		throw;
 	}
 	const auto coordinator_commit_user = "vane-" + CompactUUID(transport.operation_id);
 	PaimonDecodedDistributedCommit decoded;
-	unique_ptr<paimon::FileStoreCommit> committer;
-	std::map<int64_t, std::vector<std::shared_ptr<paimon::CommitMessage>>> commits;
 	try {
 		auto resolved_info = distributed::ResolveDistributedExtensionWriteInfo(context, distributed_write_plan);
 		DecodeCommitResults(resolved_info, transport, results, decoded);
@@ -1336,30 +1472,49 @@ idx_t PhysicalPaimonInsert::FinalizeDistributedWrite(ClientContext &context,
 		} else if (decoded.row_count == 0) {
 			throw InvalidInputException("Distributed Paimon INSERT returned commit messages without rows");
 		}
-		ValidateTargetBaseline(context, *this);
 		// Vane forwards only selected task results. The operation-scoped manifest directory supplies commit messages
 		// for completed retry/speculative losers, so cleanup touches only known attempts rather than walking the table.
 		CleanupAttemptManifests(transport, options, &decoded.selected_attempt_manifests);
-		if (decoded.messages.empty()) {
-			return 0;
-		}
-		committer = CreateCommitter(transport, options, coordinator_commit_user, true);
-		commits.emplace(transport.commit_identifier, decoded.messages);
 	} catch (...) {
+		BestEffortFenceOperation(transport, options);
 		BestEffortAbortMessages(transport, options, coordinator_commit_user, decoded.messages);
 		BestEffortCleanupAttemptManifests(transport, options);
 		throw;
 	}
-	// After this call begins, a failure can represent a successful catalog
-	// commit whose acknowledgement was lost. Do not remove operation files.
-	auto commit_result = committer->FilterAndCommit(commits);
-	if (!commit_result.ok()) {
-		throw IOException("Distributed Paimon INSERT commit outcome is unknown: %s", commit_result.status().ToString());
-	}
-	if (commit_result.value() != 1) {
-		throw IOException(
-		    "Distributed Paimon INSERT commit outcome is unknown: expected one committed operation, got %d",
-		    commit_result.value());
+	bool commit_started = false;
+	try {
+		auto &catalog = schema->catalog.Cast<PaimonCatalog>();
+		auto vane_mutex = catalog.GetVaneCatalogMutationMutex();
+		std::unique_lock<std::mutex> vane_guard(*vane_mutex);
+		// The same process-wide warehouse lock guards Paimon DDL and native commits. Holding it from this final
+		// identity check through FilterAndCommit binds the catalog write to the UUID and snapshot that were validated.
+		ValidateTargetBaseline(context, *this);
+		if (decoded.messages.empty()) {
+			return 0;
+		}
+		auto committer = CreateCommitter(transport, options, coordinator_commit_user, true);
+		std::map<int64_t, std::vector<std::shared_ptr<paimon::CommitMessage>>> commits;
+		commits.emplace(transport.commit_identifier, decoded.messages);
+		// After this call begins, a failure can represent a successful catalog
+		// commit whose acknowledgement was lost. Do not remove operation files.
+		commit_started = true;
+		auto commit_result = committer->FilterAndCommit(commits);
+		if (!commit_result.ok()) {
+			throw IOException("Distributed Paimon INSERT commit outcome is unknown: %s",
+			                  commit_result.status().ToString());
+		}
+		if (commit_result.value() != 1) {
+			throw IOException(
+			    "Distributed Paimon INSERT commit outcome is unknown: expected one committed operation, got %d",
+			    commit_result.value());
+		}
+	} catch (...) {
+		if (!commit_started) {
+			BestEffortFenceOperation(transport, options);
+			BestEffortAbortMessages(transport, options, coordinator_commit_user, decoded.messages);
+			BestEffortCleanupAttemptManifests(transport, options);
+		}
+		throw;
 	}
 	BestEffortDeleteSelectedAttemptManifests(transport, options, decoded.selected_attempt_manifests);
 	return decoded.row_count;
@@ -1376,7 +1531,15 @@ void PhysicalPaimonInsert::AbortDistributedWrite(ClientContext &context,
 	try {
 		options = BuildRuntimeOptions(context, transport);
 	} catch (...) {
+		BestEffortFenceOperation(transport, paimon_options);
 		BestEffortCleanupAttemptManifests(transport, paimon_options);
+		throw;
+	}
+	try {
+		FenceOperation(transport, options);
+	} catch (...) {
+		BestEffortFenceOperation(transport, options);
+		BestEffortCleanupAttemptManifests(transport, options);
 		throw;
 	}
 	PaimonDecodedDistributedCommit decoded;
@@ -1385,6 +1548,7 @@ void PhysicalPaimonInsert::AbortDistributedWrite(ClientContext &context,
 		DecodeCommitResults(resolved_info, transport, selected_results, decoded);
 	} catch (...) {
 		auto decode_error = std::current_exception();
+		BestEffortFenceOperation(transport, options);
 		BestEffortAbortMessages(transport, options, "vane-" + CompactUUID(transport.operation_id), decoded.messages);
 		BestEffortCleanupAttemptManifests(transport, options);
 		std::rethrow_exception(decode_error);

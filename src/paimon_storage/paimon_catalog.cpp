@@ -55,6 +55,20 @@ namespace duckdb {
 static constexpr const char *S3_PATH_PREFIX = "s3://";
 static constexpr const char *OSS_PATH_PREFIX = "oss://";
 
+#ifdef PAIMON_VANE_DISTRIBUTED
+shared_ptr<std::mutex> PaimonCatalog::GetVaneCatalogMutationMutex() const {
+	static std::mutex registry_mutex;
+	static unordered_map<string, weak_ptr<std::mutex>> registry;
+	std::lock_guard<std::mutex> guard(registry_mutex);
+	auto result = registry[path].lock();
+	if (!result) {
+		result = make_shared_ptr<std::mutex>();
+		registry[path] = result;
+	}
+	return result;
+}
+#endif
+
 static std::optional<string> TryGetPaimonOptionValue(const unordered_map<string, Value> &input_options,
                                                      const string &key) {
 	for (const auto &entry : input_options) {
@@ -265,6 +279,10 @@ string PaimonCatalog::GetCatalogType() {
 }
 
 optional_ptr<CatalogEntry> PaimonCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
+#ifdef PAIMON_VANE_DISTRIBUTED
+	auto vane_mutex = GetVaneCatalogMutationMutex();
+	std::lock_guard<std::mutex> vane_guard(*vane_mutex);
+#endif
 	bool ignore_if_exists = info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT;
 	auto status = paimon_catalog->CreateDatabase(info.schema, {}, ignore_if_exists);
 	if (!status.ok()) {
@@ -378,6 +396,10 @@ ErrorData PaimonCatalog::SupportsCreateTable(BoundCreateTableInfo &info) {
 }
 
 void PaimonCatalog::DropSchema(ClientContext &context, DropInfo &info) {
+#ifdef PAIMON_VANE_DISTRIBUTED
+	auto vane_mutex = GetVaneCatalogMutationMutex();
+	std::lock_guard<std::mutex> vane_guard(*vane_mutex);
+#endif
 	bool ignore_if_not_exists = info.if_not_found == OnEntryNotFound::RETURN_NULL;
 	auto status = paimon_catalog->DropDatabase(info.name, ignore_if_not_exists, info.cascade);
 	if (!status.ok()) {

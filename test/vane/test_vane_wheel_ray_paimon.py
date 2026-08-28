@@ -553,6 +553,13 @@ def vane_attempt_manifests(table_path: Path) -> list[Path]:
     return sorted(path for path in manifest_root.rglob("*.commit") if path.is_file())
 
 
+def vane_operation_fences(table_path: Path) -> list[Path]:
+    fence_root = table_path.parent.parent / ".vane/paimon/fences"
+    if not fence_root.exists():
+        return []
+    return sorted(path for path in fence_root.rglob("*.closed") if path.is_file())
+
+
 def table_file_inventory(table_path: Path) -> list[Path]:
     return sorted(path.relative_to(table_path) for path in table_path.rglob("*") if path.is_file())
 
@@ -742,6 +749,7 @@ def exercise_unselected_attempt_artifact_cleanup(
     from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
     from vane.runners.local.runner import _InProcessFragmentExecutor
 
+    baseline_fences = set(vane_operation_fences(target_path))
     logical_plan = harness.capture_write_plan(
         lambda: source_insert_relation(harness, multi_path).insert_into(UNSELECTED_ATTEMPT_INSERT_TARGET)
     )
@@ -753,13 +761,23 @@ def exercise_unselected_attempt_artifact_cleanup(
         max_running_tasks=WORKER_COUNT,
     )
     retry_executor = _InProcessFragmentExecutor()
+    retry_started = threading.Event()
+    retry_release = threading.Event()
+
+    def execute_late_retry(request: object) -> object:
+        retry_started.set()
+        if not retry_release.wait(timeout=120):
+            raise TimeoutError("timed out waiting to release the late unselected retry")
+        return retry_executor(request)
+
     retry_backend = NativeFteWorkerManagerBackend(
-        execute_fn=retry_executor,
+        execute_fn=execute_late_retry,
         num_workers=1,
         max_running_tasks=1,
     )
     original_submit_tasks = backend.submit_tasks
     loser_attempt_digests: list[str] = []
+    loser_handles: list[object] = []
     retry_scheduled = False
 
     def submit_with_unselected_attempt_artifact(tasks: object) -> list[object]:
@@ -775,31 +793,26 @@ def exercise_unselected_attempt_artifact_cleanup(
             retry_context = dict(retry_request.get("context") or {})
             retry_context["attempt_id"] = str(retry_id.attempt_id)
             retry_request["context"] = retry_context
+            digest = hashlib.md5()
+            digest.update(retry_id.query_id.encode())
+            digest.update(b"\0")
+            digest.update(str(retry_id).encode())
+            loser_attempt_digests.append(digest.hexdigest())
             original_get_result = handles[0].get_result_sync
 
             def get_result_with_unselected_retry() -> object:
                 selected_result = original_get_result()
-                loser_handles = list(retry_backend.submit_tasks([retry_request]))
-                require_equal(len(loser_handles), 1, "unselected retry handle count")
+                submitted_handles = list(retry_backend.submit_tasks([retry_request]))
+                require_equal(len(submitted_handles), 1, "unselected retry handle count")
+                loser_handles.extend(submitted_handles)
                 source_node_ids = list(retry_request.get("source_node_ids") or [])
                 if source_node_ids:
                     retry_backend.task_input_stream_exhausted(retry_id.query_id, source_node_ids)
-                # Materialize a genuine successful retry but intentionally omit its handle from Vane's selected
-                # results. Its manifest is the only coordinator-visible recovery index for the discarded attempt.
-                loser_handle = loser_handles[0]
-                deadline = time.monotonic() + WORKER_PLAN_CAPTURE_TIMEOUT_SECONDS
-                while not loser_handle.done():
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError("timed out waiting for the unselected retry attempt")
-                    time.sleep(0.01)
-                loser_handle.get_result_sync()
-                loser_handle.ack()
-                loser_handle.release_result_payload()
-                digest = hashlib.md5()
-                digest.update(retry_id.query_id.encode())
-                digest.update(b"\0")
-                digest.update(str(retry_id).encode())
-                loser_attempt_digests.append(digest.hexdigest())
+                # Register a genuine retry before the coordinator sees the selected result, but keep its execution
+                # blocked. Releasing it only after run_copy_plan returns forces it to finish after the coordinator's
+                # manifest scan and catalog commit.
+                if not retry_started.wait(timeout=WORKER_PLAN_CAPTURE_TIMEOUT_SECONDS):
+                    raise TimeoutError("timed out waiting for the late unselected retry to start")
                 return selected_result
 
             handles[0].get_result_sync = get_result_with_unselected_retry
@@ -827,7 +840,31 @@ def exercise_unselected_attempt_artifact_cleanup(
             int(result.get("extension_task_result_count") or 0) >= WORKER_COUNT,
             "unselected attempt cleanup did not select enough worker tasks",
         )
+        retry_release.set()
+        require_equal(len(loser_handles), 1, "late unselected retry handle count")
+        loser_handle = loser_handles[0]
+        deadline = time.monotonic() + WORKER_PLAN_CAPTURE_TIMEOUT_SECONDS
+        while not loser_handle.done():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("timed out waiting for the late unselected retry attempt")
+            time.sleep(0.01)
+        late_retry_error: BaseException | None = None
+        try:
+            loser_handle.get_result_sync()
+        except BaseException as error:
+            late_retry_error = error
+        finally:
+            try:
+                loser_handle.ack()
+            finally:
+                loser_handle.release_result_payload()
+        require_true(late_retry_error is not None, "late unselected retry unexpectedly succeeded")
+        if not error_chain_contains(late_retry_error, "operation is fenced"):
+            raise AssertionError(
+                f"late unselected retry returned the wrong error: {late_retry_error!r}"
+            ) from late_retry_error
     finally:
+        retry_release.set()
         try:
             blocked_directory.chmod(0o755)
         finally:
@@ -858,6 +895,8 @@ def exercise_unselected_attempt_artifact_cleanup(
         [],
         "successful INSERT attempt-manifest cleanup",
     )
+    new_fences = set(vane_operation_fences(target_path)) - baseline_fences
+    require_equal(len(new_fences), 1, "successful INSERT operation fence count")
     require_equal(
         snapshot_count(harness.connection, target_path),
         1,

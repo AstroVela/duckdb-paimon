@@ -92,6 +92,10 @@ optional_ptr<CatalogEntry> PaimonSchemaEntry::CreateTable(CatalogTransaction tra
 	}
 
 	auto &catalog = ParentCatalog().Cast<PaimonCatalog>();
+#ifdef PAIMON_VANE_DISTRIBUTED
+	auto vane_mutex = catalog.GetVaneCatalogMutationMutex();
+	std::lock_guard<std::mutex> vane_guard(*vane_mutex);
+#endif
 	auto &paimon_catalog = catalog.GetPaimonCatalog();
 	paimon::Identifier identifier(name, base.table);
 
@@ -201,6 +205,10 @@ void PaimonSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	}
 
 	auto &catalog = ParentCatalog().Cast<PaimonCatalog>();
+#ifdef PAIMON_VANE_DISTRIBUTED
+	auto vane_mutex = catalog.GetVaneCatalogMutationMutex();
+	std::lock_guard<std::mutex> vane_guard(*vane_mutex);
+#endif
 	auto &paimon_catalog = catalog.GetPaimonCatalog();
 	paimon::Identifier identifier(name, info.name);
 
