@@ -79,7 +79,6 @@ static constexpr idx_t PAIMON_DISTRIBUTED_ATTEMPT_DIGEST_SIZE = 32;
 
 struct PaimonDistributedInsertTransport {
 	string operation_id;
-	string warehouse_path;
 	string database_name;
 	string table_name;
 	string table_uuid;
@@ -180,15 +179,6 @@ static string SchemaFingerprint(const string &schema_json) {
 	return context.FinishHex();
 }
 
-static string TableIdentityDigest(const PaimonDistributedInsertTransport &transport) {
-	MD5Context context;
-	context.Add(transport.table_uuid);
-	const data_t separator = 0;
-	context.Add(&separator, 1);
-	context.Add(transport.table_path);
-	return context.FinishHex();
-}
-
 static string CompactUUID(const string &uuid) {
 	string result;
 	result.reserve(uuid.size());
@@ -243,15 +233,11 @@ static string AttemptManifestPath(const PaimonDistributedInsertTransport &transp
 }
 
 static string OperationRoot(const PaimonDistributedInsertTransport &transport) {
-	return JoinPath(transport.warehouse_path, ".vane/paimon/" + string(PAIMON_DISTRIBUTED_OPERATION_DIRECTORY));
-}
-
-static string TableOperationDirectory(const PaimonDistributedInsertTransport &transport) {
-	return JoinPath(OperationRoot(transport), TableIdentityDigest(transport));
+	return JoinPath(transport.table_path, ".vane/paimon/" + string(PAIMON_DISTRIBUTED_OPERATION_DIRECTORY));
 }
 
 static string OperationMarkerPath(const PaimonDistributedInsertTransport &transport) {
-	return JoinPath(TableOperationDirectory(transport),
+	return JoinPath(OperationRoot(transport),
 	                CompactUUID(transport.operation_id) + PAIMON_DISTRIBUTED_OPERATION_MARKER_SUFFIX);
 }
 
@@ -284,10 +270,9 @@ static map<string, string> GetPortableWriteOptions(const map<string, string> &op
 }
 
 static void ValidateTransport(const PaimonDistributedInsertTransport &transport) {
-	if (!IsCanonicalUUID(transport.operation_id) || transport.warehouse_path.empty() ||
-	    transport.database_name.empty() || transport.table_name.empty() || transport.table_uuid.empty() ||
-	    transport.table_path.empty() || transport.table_schema_json.empty() || transport.schema_id < 0 ||
-	    transport.commit_identifier <= 0 || transport.input_types.empty() ||
+	if (!IsCanonicalUUID(transport.operation_id) || transport.database_name.empty() || transport.table_name.empty() ||
+	    transport.table_uuid.empty() || transport.table_path.empty() || transport.table_schema_json.empty() ||
+	    transport.schema_id < 0 || transport.commit_identifier <= 0 || transport.input_types.empty() ||
 	    transport.input_types.size() != transport.input_names.size() || transport.null_part_name.empty()) {
 		throw SerializationException("Distributed Paimon INSERT bind has incomplete target state");
 	}
@@ -336,7 +321,6 @@ static void SerializeTransport(Serializer &serializer, const PaimonDistributedIn
 	serializer.WriteProperty(15, "portable_options", transport.portable_options);
 	serializer.WriteProperty(16, "append_only", transport.append_only);
 	serializer.WriteProperty(17, "table_uuid", transport.table_uuid);
-	serializer.WriteProperty(18, "warehouse_path", transport.warehouse_path);
 }
 
 static string SerializeTransport(const PaimonDistributedInsertTransport &transport) {
@@ -378,7 +362,6 @@ static PaimonDistributedInsertTransport DeserializeTransport(const string &bytes
 	result.portable_options = deserializer.ReadProperty<map<string, string>>(15, "portable_options");
 	result.append_only = deserializer.ReadProperty<bool>(16, "append_only");
 	result.table_uuid = deserializer.ReadProperty<string>(17, "table_uuid");
-	result.warehouse_path = deserializer.ReadProperty<string>(18, "warehouse_path");
 	deserializer.End();
 	ValidateTransport(result);
 	return result;
@@ -606,9 +589,8 @@ static string SerializeOperationMarker(const PaimonDistributedInsertTransport &t
 	serializer.Begin();
 	serializer.WriteProperty(1, "protocol_version", PAIMON_DISTRIBUTED_INSERT_PROTOCOL_VERSION);
 	serializer.WriteProperty(2, "operation_id", transport.operation_id);
-	serializer.WriteProperty(3, "warehouse_path", transport.warehouse_path);
-	serializer.WriteProperty(4, "table_uuid", transport.table_uuid);
-	serializer.WriteProperty(5, "table_path", transport.table_path);
+	serializer.WriteProperty(3, "table_uuid", transport.table_uuid);
+	serializer.WriteProperty(4, "table_path", transport.table_path);
 	serializer.End();
 	return string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
 }
@@ -647,7 +629,6 @@ static void OpenOperation(const PaimonDistributedInsertTransport &transport, con
 static void BestEffortDeleteOperationDirectories(paimon::FileSystem &file_system,
                                                  const PaimonDistributedInsertTransport &transport) noexcept {
 	try {
-		(void)file_system.Delete(TableOperationDirectory(transport), false);
 		(void)file_system.Delete(OperationRoot(transport), false);
 	} catch (...) {
 	}
@@ -1306,7 +1287,6 @@ static void DecodeCommitResults(const DistributedExtensionWriteInfo &info,
 static PaimonDistributedInsertTransport GetCoordinatorTransport(const PhysicalPaimonInsert &insert) {
 	auto transport = DeserializeTransport(insert.distributed_write_plan.worker_bind_data);
 	if (transport.operation_id != insert.distributed_operation_id ||
-	    transport.warehouse_path != insert.distributed_warehouse_path ||
 	    transport.database_name != insert.table_identifier.GetDatabaseName() ||
 	    transport.table_name != insert.table_identifier.GetTableName() ||
 	    transport.table_uuid != insert.distributed_table_uuid ||
@@ -1334,7 +1314,9 @@ static void ValidateCoordinatorShape(const PhysicalPaimonInsert &insert) {
 		throw NotImplementedException("Distributed Paimon INSERT supports append-only tables");
 	}
 	if (!insert.distributed_target_initialized || !insert.distributed_worker_plan_selected ||
-	    !insert.distributed_operation_open || insert.distributed_write_plan.extension_name != "paimon" ||
+	    !insert.distributed_operation_open || insert.distributed_operation_options.empty() ||
+	    insert.distributed_operation_path != insert.distributed_table_path ||
+	    insert.distributed_write_plan.extension_name != "paimon" ||
 	    insert.distributed_write_plan.operator_name != PAIMON_DISTRIBUTED_INSERT_OPERATOR ||
 	    insert.distributed_write_plan.worker_bind_data.empty() || insert.children.size() != 1 ||
 	    insert.children[0].get().types != insert.distributed_input_types) {
@@ -1385,7 +1367,7 @@ PhysicalPaimonInsert::~PhysicalPaimonInsert() {
 	// lifetime no longer than the coordinator plan that could authorize those workers.
 	try {
 		auto transport = DeserializeTransport(distributed_write_plan.worker_bind_data);
-		(void)BestEffortCloseOperation(transport, paimon_options);
+		(void)BestEffortCloseOperation(transport, distributed_operation_options);
 	} catch (...) {
 	}
 }
@@ -1400,8 +1382,15 @@ void PhysicalPaimonInsert::InitializeDistributedWrite(const vector<LogicalType> 
 	if (!schema) {
 		throw InternalException("Distributed Paimon INSERT requires a coordinator schema entry");
 	}
+	if (distributed_operation_path.empty() || distributed_operation_options.empty()) {
+		throw InternalException("Distributed Paimon INSERT requires its table file-system options");
+	}
 	auto &catalog = schema->catalog.Cast<PaimonCatalog>();
 	auto target = LoadTargetState(catalog, table_identifier);
+	if (target.table_path != distributed_operation_path) {
+		throw TransactionException("Paimon table %s path changed after its file-system options were resolved",
+		                           table_identifier.ToString());
+	}
 	if (input_types.size() != target.field_names.size()) {
 		throw InvalidInputException("Paimon INSERT input schema does not match the target table width");
 	}
@@ -1415,7 +1404,6 @@ void PhysicalPaimonInsert::InitializeDistributedWrite(const vector<LogicalType> 
 	}
 	distributed_operation_id = UUID::ToString(UUID::GenerateRandomUUID());
 	distributed_commit_identifier = CreateCommitIdentifier(distributed_operation_id);
-	distributed_warehouse_path = catalog.GetVaneWarehouseIdentity();
 	distributed_table_uuid = std::move(target.table_uuid);
 	distributed_table_path = std::move(target.table_path);
 	distributed_table_schema_json = std::move(target.table_schema_json);
@@ -1427,10 +1415,12 @@ void PhysicalPaimonInsert::InitializeDistributedWrite(const vector<LogicalType> 
 	distributed_input_names = std::move(target.field_names);
 	distributed_null_part_name = std::move(target.null_part_name);
 	distributed_portable_options = GetPortableWriteOptions(paimon_options);
+	for (const auto &option : distributed_portable_options) {
+		distributed_operation_options[option.first] = option.second;
+	}
 
 	PaimonDistributedInsertTransport transport;
 	transport.operation_id = distributed_operation_id;
-	transport.warehouse_path = distributed_warehouse_path;
 	transport.database_name = table_identifier.GetDatabaseName();
 	transport.table_name = table_identifier.GetTableName();
 	transport.table_uuid = distributed_table_uuid;
@@ -1450,14 +1440,14 @@ void PhysicalPaimonInsert::InitializeDistributedWrite(const vector<LogicalType> 
 	try {
 		// The marker is the worker's positive authorization to publish. It must exist before Vane can serialize the
 		// worker plan; removing it later closes the operation without retaining a tombstone for every INSERT.
-		OpenOperation(transport, paimon_options);
+		OpenOperation(transport, distributed_operation_options);
 		distributed_write_plan.extension_name = "paimon";
 		distributed_write_plan.operator_name = PAIMON_DISTRIBUTED_INSERT_OPERATOR;
 		distributed_write_plan.worker_bind_data = std::move(worker_bind_data);
 		distributed_target_initialized = true;
 		distributed_operation_open = true;
 	} catch (...) {
-		(void)BestEffortCloseOperation(transport, paimon_options);
+		(void)BestEffortCloseOperation(transport, distributed_operation_options);
 		throw;
 	}
 }
@@ -1501,9 +1491,9 @@ idx_t PhysicalPaimonInsert::FinalizeDistributedWrite(ClientContext &context,
 	try {
 		options = BuildRuntimeOptions(context, transport);
 	} catch (...) {
-		if (BestEffortCloseOperation(transport, paimon_options)) {
+		if (BestEffortCloseOperation(transport, distributed_operation_options)) {
 			distributed_operation_open = false;
-			BestEffortCleanupAttemptManifests(transport, paimon_options);
+			BestEffortCleanupAttemptManifests(transport, distributed_operation_options);
 		}
 		throw;
 	}
@@ -1588,9 +1578,9 @@ void PhysicalPaimonInsert::AbortDistributedWrite(ClientContext &context,
 	try {
 		options = BuildRuntimeOptions(context, transport);
 	} catch (...) {
-		if (BestEffortCloseOperation(transport, paimon_options)) {
+		if (BestEffortCloseOperation(transport, distributed_operation_options)) {
 			distributed_operation_open = false;
-			BestEffortCleanupAttemptManifests(transport, paimon_options);
+			BestEffortCleanupAttemptManifests(transport, distributed_operation_options);
 		}
 		throw;
 	}

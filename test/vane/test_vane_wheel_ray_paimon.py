@@ -554,7 +554,7 @@ def vane_attempt_manifests(table_path: Path) -> list[Path]:
 
 
 def vane_open_operations(table_path: Path) -> list[Path]:
-    operation_root = table_path.parent.parent / ".vane/paimon/operations"
+    operation_root = table_path / ".vane/paimon/operations"
     if not operation_root.exists():
         return []
     return sorted(path for path in operation_root.rglob("*.open") if path.is_file())

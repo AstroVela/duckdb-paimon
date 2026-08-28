@@ -381,8 +381,21 @@ PhysicalOperator &PaimonCatalog::PlanInsert(ClientContext &context, PhysicalPlan
 		plan = planner.ResolveDefaultsProjection(op, *plan);
 	}
 
+#ifdef PAIMON_VANE_DISTRIBUTED
+	auto distributed_table_path_result = paimon_catalog->GetTableLocation(table_identifier);
+	if (!distributed_table_path_result.ok()) {
+		throw IOException(distributed_table_path_result.status().ToString());
+	}
+	auto distributed_table_path = std::move(distributed_table_path_result).value();
+	const unordered_map<string, Value> distributed_local_options;
+	auto distributed_operation_options = GetPaimonOptions(context, distributed_table_path, distributed_local_options);
+#endif
 	auto &insert = planner.Make<PhysicalPaimonInsert>(op, table.schema, nullptr, std::move(table_identifier),
 	                                                  std::move(paimon_options), std::move(part_keys), 0U);
+#ifdef PAIMON_VANE_DISTRIBUTED
+	insert.Cast<PhysicalPaimonInsert>().SetVaneOperationOptions(std::move(distributed_table_path),
+	                                                            std::move(distributed_operation_options));
+#endif
 	if (plan) {
 		insert.children.push_back(*plan);
 	}

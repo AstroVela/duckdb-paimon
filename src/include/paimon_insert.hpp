@@ -63,12 +63,13 @@ public:
 #ifdef PAIMON_VANE_DISTRIBUTED
 	distributed::DistributedExtensionWritePlan distributed_write_plan;
 	string distributed_operation_id;
-	string distributed_warehouse_path;
 	string distributed_table_uuid;
 	string distributed_table_path;
 	string distributed_table_schema_json;
 	vector<LogicalType> distributed_input_types;
 	vector<string> distributed_input_names;
+	string distributed_operation_path;
+	map<string, string> distributed_operation_options;
 	map<string, string> distributed_portable_options;
 	string distributed_null_part_name;
 	int64_t distributed_schema_id = -1;
@@ -107,6 +108,10 @@ public:
 	                                 OperatorSourceInput &input) const override;
 
 #ifdef PAIMON_VANE_DISTRIBUTED
+	void SetVaneOperationOptions(string table_path, map<string, string> options) {
+		distributed_operation_path = std::move(table_path);
+		distributed_operation_options = std::move(options);
+	}
 	void InitializeDistributedWrite(const vector<LogicalType> &input_types);
 	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override;
 	const distributed::DistributedExtensionWritePlan &WritePlan() const override;
