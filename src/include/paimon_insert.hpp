@@ -81,6 +81,7 @@ public:
 	bool distributed_worker_plan_selected = false;
 	mutable bool distributed_operation_open = false;
 	mutable bool distributed_recovery_intent_published = false;
+	mutable bool distributed_terminal_resolution_started = false;
 	mutable bool distributed_finalize_started = false;
 #endif
 

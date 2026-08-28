@@ -1195,6 +1195,44 @@ BestEffortDeleteSelectedAttemptManifests(const PaimonDistributedInsertTransport 
 	}
 }
 
+static void BestEffortResolveAbortedOperation(PaimonCatalog &catalog, const PaimonDistributedInsertTransport &transport,
+                                              const map<string, string> &options, const string &commit_user,
+                                              const PaimonDecodedDistributedCommit &decoded, bool &operation_open,
+                                              bool &recovery_intent_published) noexcept {
+	try {
+		auto vane_mutex = catalog.GetVaneCatalogMutationMutex();
+		std::unique_lock<std::mutex> vane_guard(*vane_mutex);
+		PaimonDistributedRecoveryIntent abort_intent;
+		abort_intent.transport = transport;
+		abort_intent.action = PaimonDistributedRecoveryAction::ABORT;
+		auto payload = SerializeRecoveryIntent(abort_intent);
+		bool publication_may_exist = false;
+		try {
+			PublishRecoveryIntent(abort_intent, payload, options, publication_may_exist);
+			recovery_intent_published = true;
+		} catch (...) {
+			recovery_intent_published = publication_may_exist;
+			return;
+		}
+		try {
+			CloseOperation(transport, options);
+			operation_open = false;
+		} catch (...) {
+			return;
+		}
+		try {
+			AbortMessages(transport, options, commit_user, decoded.messages);
+			CleanupAttemptManifests(transport, options);
+		} catch (...) {
+			return;
+		}
+		if (BestEffortDeleteRecoveryRecords(transport, options)) {
+			recovery_intent_published = false;
+		}
+	} catch (...) {
+	}
+}
+
 static bool TargetMatchesRecoveryBaseline(const PaimonDistributedTargetState &target,
                                           const PaimonDistributedInsertTransport &transport) {
 	return target.table_uuid == transport.table_uuid && target.table_path == transport.table_path &&
@@ -1912,9 +1950,9 @@ PhysicalPaimonInsert::~PhysicalPaimonInsert() {
 		UnregisterActiveOperation(distributed_operation_id);
 		return;
 	}
-	if (distributed_recovery_intent_published) {
-		// Publication may have succeeded even when its acknowledgement was lost. Preserve the full marker so the next
-		// coordinator can either consume the recovery record or safely convert an unrecorded operation to ABORT.
+	if (distributed_recovery_intent_published || distributed_terminal_resolution_started) {
+		// Publication may have succeeded even when its acknowledgement was lost, while a confirmed publication failure
+		// leaves the full marker as the recovery handoff. Preserve either form for the next coordinator.
 		UnregisterActiveOperation(distributed_operation_id);
 		return;
 	}
@@ -2046,24 +2084,24 @@ void PhysicalPaimonInsert::ValidateDistributedWrite(ClientContext &context) cons
 
 idx_t PhysicalPaimonInsert::FinalizeDistributedWrite(ClientContext &context,
                                                      const vector<DistributedWriteTaskResult> &results) const {
+	distributed_terminal_resolution_started = true;
 	ValidateCoordinatorShape(*this);
 	if (distributed_finalize_started) {
 		throw InvalidInputException("Distributed Paimon INSERT coordinator finalized more than once");
 	}
 	distributed_finalize_started = true;
+	auto &catalog = schema->catalog.Cast<PaimonCatalog>();
 	auto transport = GetCoordinatorTransport(*this);
+	const auto coordinator_commit_user = "vane-" + CompactUUID(transport.operation_id);
+	PaimonDecodedDistributedCommit decoded;
 	map<string, string> options;
 	try {
 		options = BuildRuntimeOptions(context, transport);
 	} catch (...) {
-		if (BestEffortCloseOperation(transport, distributed_operation_options)) {
-			distributed_operation_open = false;
-			BestEffortCleanupAttemptManifests(transport, distributed_operation_options);
-		}
+		BestEffortResolveAbortedOperation(catalog, transport, distributed_operation_options, coordinator_commit_user,
+		                                  decoded, distributed_operation_open, distributed_recovery_intent_published);
 		throw;
 	}
-	const auto coordinator_commit_user = "vane-" + CompactUUID(transport.operation_id);
-	PaimonDecodedDistributedCommit decoded;
 	try {
 		auto resolved_info = distributed::ResolveDistributedExtensionWriteInfo(context, distributed_write_plan);
 		DecodeCommitResults(resolved_info, transport, results, decoded);
@@ -2075,11 +2113,8 @@ idx_t PhysicalPaimonInsert::FinalizeDistributedWrite(ClientContext &context,
 			throw InvalidInputException("Distributed Paimon INSERT returned commit messages without rows");
 		}
 	} catch (...) {
-		if (BestEffortCloseOperation(transport, options)) {
-			distributed_operation_open = false;
-		}
-		BestEffortAbortMessages(transport, options, coordinator_commit_user, decoded.messages);
-		BestEffortCleanupAttemptManifests(transport, options);
+		BestEffortResolveAbortedOperation(catalog, transport, options, coordinator_commit_user, decoded,
+		                                  distributed_operation_open, distributed_recovery_intent_published);
 		throw;
 	}
 
@@ -2093,15 +2128,11 @@ idx_t PhysicalPaimonInsert::FinalizeDistributedWrite(ClientContext &context,
 		recovery_intent.row_count = decoded.row_count;
 		recovery_payload = SerializeRecoveryIntent(recovery_intent);
 	} catch (...) {
-		if (BestEffortCloseOperation(transport, options)) {
-			distributed_operation_open = false;
-		}
-		BestEffortAbortMessages(transport, options, coordinator_commit_user, decoded.messages);
-		BestEffortCleanupAttemptManifests(transport, options);
+		BestEffortResolveAbortedOperation(catalog, transport, options, coordinator_commit_user, decoded,
+		                                  distributed_operation_open, distributed_recovery_intent_published);
 		throw;
 	}
 	try {
-		auto &catalog = schema->catalog.Cast<PaimonCatalog>();
 		auto vane_mutex = catalog.GetVaneCatalogMutationMutex();
 		std::unique_lock<std::mutex> vane_guard(*vane_mutex);
 		// The process-wide warehouse lock serializes target validation, durable intent publication, commit, and
@@ -2162,11 +2193,8 @@ idx_t PhysicalPaimonInsert::FinalizeDistributedWrite(ClientContext &context,
 		}
 	} catch (...) {
 		if (!distributed_recovery_intent_published) {
-			if (BestEffortCloseOperation(transport, options)) {
-				distributed_operation_open = false;
-			}
-			BestEffortAbortMessages(transport, options, coordinator_commit_user, decoded.messages);
-			BestEffortCleanupAttemptManifests(transport, options);
+			BestEffortResolveAbortedOperation(catalog, transport, options, coordinator_commit_user, decoded,
+			                                  distributed_operation_open, distributed_recovery_intent_published);
 		}
 		throw;
 	}
@@ -2175,22 +2203,23 @@ idx_t PhysicalPaimonInsert::FinalizeDistributedWrite(ClientContext &context,
 
 void PhysicalPaimonInsert::AbortDistributedWrite(ClientContext &context,
                                                  const vector<DistributedWriteTaskResult> &selected_results) const {
+	distributed_terminal_resolution_started = true;
 	ValidateCoordinatorShape(*this);
 	if (distributed_finalize_started) {
 		throw InvalidInputException("Distributed Paimon INSERT cannot abort after coordinator finalization started");
 	}
+	auto &catalog = schema->catalog.Cast<PaimonCatalog>();
 	auto transport = GetCoordinatorTransport(*this);
+	const auto coordinator_commit_user = "vane-" + CompactUUID(transport.operation_id);
+	PaimonDecodedDistributedCommit decoded;
 	map<string, string> options;
 	try {
 		options = BuildRuntimeOptions(context, transport);
 	} catch (...) {
-		if (BestEffortCloseOperation(transport, distributed_operation_options)) {
-			distributed_operation_open = false;
-			BestEffortCleanupAttemptManifests(transport, distributed_operation_options);
-		}
+		BestEffortResolveAbortedOperation(catalog, transport, distributed_operation_options, coordinator_commit_user,
+		                                  decoded, distributed_operation_open, distributed_recovery_intent_published);
 		throw;
 	}
-	PaimonDecodedDistributedCommit decoded;
 	std::exception_ptr decode_error;
 	try {
 		auto resolved_info = distributed::ResolveDistributedExtensionWriteInfo(context, distributed_write_plan);
@@ -2211,15 +2240,11 @@ void PhysicalPaimonInsert::AbortDistributedWrite(ClientContext &context,
 		}
 		recovery_payload = SerializeRecoveryIntent(recovery_intent);
 	} catch (...) {
-		if (BestEffortCloseOperation(transport, options)) {
-			distributed_operation_open = false;
-		}
-		BestEffortAbortMessages(transport, options, "vane-" + CompactUUID(transport.operation_id), decoded.messages);
-		BestEffortCleanupAttemptManifests(transport, options);
+		BestEffortResolveAbortedOperation(catalog, transport, options, coordinator_commit_user, decoded,
+		                                  distributed_operation_open, distributed_recovery_intent_published);
 		throw;
 	}
 	try {
-		auto &catalog = schema->catalog.Cast<PaimonCatalog>();
 		auto vane_mutex = catalog.GetVaneCatalogMutationMutex();
 		std::unique_lock<std::mutex> vane_guard(*vane_mutex);
 		bool recovery_intent_may_exist = false;
@@ -2232,19 +2257,15 @@ void PhysicalPaimonInsert::AbortDistributedWrite(ClientContext &context,
 		}
 		CloseOperation(transport, options);
 		distributed_operation_open = false;
-		AbortMessages(transport, options, "vane-" + CompactUUID(transport.operation_id), decoded.messages);
+		AbortMessages(transport, options, coordinator_commit_user, decoded.messages);
 		CleanupAttemptManifests(transport, options);
 		if (BestEffortDeleteRecoveryRecords(transport, options)) {
 			distributed_recovery_intent_published = false;
 		}
 	} catch (...) {
 		if (!distributed_recovery_intent_published) {
-			if (BestEffortCloseOperation(transport, options)) {
-				distributed_operation_open = false;
-			}
-			BestEffortAbortMessages(transport, options, "vane-" + CompactUUID(transport.operation_id),
-			                        decoded.messages);
-			BestEffortCleanupAttemptManifests(transport, options);
+			BestEffortResolveAbortedOperation(catalog, transport, options, coordinator_commit_user, decoded,
+			                                  distributed_operation_open, distributed_recovery_intent_published);
 		}
 		throw;
 	}
