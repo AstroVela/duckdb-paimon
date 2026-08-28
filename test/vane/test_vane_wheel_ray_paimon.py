@@ -560,11 +560,11 @@ def vane_open_operations(table_path: Path) -> list[Path]:
     return sorted(path for path in operation_root.rglob("*.open") if path.is_file())
 
 
-def vane_recovery_intents(table_path: Path) -> list[Path]:
+def vane_recovery_records(table_path: Path) -> list[Path]:
     recovery_root = table_path / ".vane/paimon/recovery"
     if not recovery_root.exists():
         return []
-    return sorted(path for path in recovery_root.rglob("*.intent") if path.is_file())
+    return sorted(path for path in recovery_root.rglob("*") if path.is_file())
 
 
 def table_file_inventory(table_path: Path) -> list[Path]:
@@ -1326,7 +1326,7 @@ def main() -> None:
             for target, target_path in target_paths.items():
                 require_equal(vane_open_operations(target_path), [], f"{target} retained operation markers")
                 require_equal(vane_attempt_manifests(target_path), [], f"{target} retained attempt manifests")
-                require_equal(vane_recovery_intents(target_path), [], f"{target} retained recovery intents")
+                require_equal(vane_recovery_records(target_path), [], f"{target} retained recovery records")
             require_true(
                 harness.read_dispatch_count >= 9,
                 "Ray suite did not exercise enough reads",
