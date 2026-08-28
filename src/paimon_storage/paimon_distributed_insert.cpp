@@ -1030,6 +1030,13 @@ static void ValidateTargetBaseline(ClientContext &context, const PhysicalPaimonI
 
 } // namespace
 
+void PhysicalPaimonInsert::SetDistributedWriteContext(ClientContext &context) {
+	if (distributed_context) {
+		throw InternalException("Distributed Paimon INSERT context was set more than once");
+	}
+	distributed_context = context;
+}
+
 void PhysicalPaimonInsert::InitializeDistributedWrite(ClientContext &context, const vector<LogicalType> &input_types) {
 	if (info) {
 		return;
@@ -1041,6 +1048,7 @@ void PhysicalPaimonInsert::InitializeDistributedWrite(ClientContext &context, co
 		throw InternalException("Distributed Paimon INSERT requires a coordinator schema entry");
 	}
 	auto &catalog = schema->catalog.Cast<PaimonCatalog>();
+	std::lock_guard<std::mutex> vane_guard(PaimonCatalog::GetVaneCatalogMutationMutex());
 	auto target = LoadTargetState(context, catalog, table_identifier);
 	if (input_types != target.field_types) {
 		throw InvalidInputException("Paimon INSERT input schema does not match the current target table types");
@@ -1092,8 +1100,14 @@ optional_ptr<distributed::ExtensionWriteTaskProvider> PhysicalPaimonInsert::GetE
 	if (distributed_worker_plan_selected) {
 		return this;
 	}
-	if (!distributed_target_initialized || children.size() != 1) {
-		throw InvalidInputException("Distributed Paimon INSERT requires exactly one initialized physical child");
+	if (children.size() != 1) {
+		throw InvalidInputException("Distributed Paimon INSERT requires exactly one physical child");
+	}
+	if (!distributed_context) {
+		throw InvalidInputException("Distributed Paimon INSERT has no coordinator context");
+	}
+	if (!distributed_target_initialized) {
+		InitializeDistributedWrite(*distributed_context, children[0].get().types);
 	}
 	distributed_worker_plan_selected = true;
 	return this;
@@ -1106,6 +1120,7 @@ const distributed::DistributedExtensionWritePlan &PhysicalPaimonInsert::WritePla
 
 void PhysicalPaimonInsert::ValidateDistributedWrite(ClientContext &context) const {
 	ValidateCoordinatorShape(*this);
+	std::lock_guard<std::mutex> vane_guard(PaimonCatalog::GetVaneCatalogMutationMutex());
 	ValidateTargetBaseline(context, *this);
 }
 
@@ -1125,23 +1140,31 @@ idx_t PhysicalPaimonInsert::FinalizeDistributedWrite(ClientContext &context,
 	try {
 		auto resolved_info = distributed::ResolveDistributedExtensionWriteInfo(context, distributed_write_plan);
 		DecodeCommitResults(resolved_info, transport, results, decoded);
+	} catch (...) {
+		BestEffortAbortMessages(transport, options, coordinator_commit_user, decoded.messages);
+		throw;
+	}
+	std::unique_lock<std::mutex> vane_guard(PaimonCatalog::GetVaneCatalogMutationMutex());
+	try {
+		ValidateTargetBaseline(context, *this);
 		if (decoded.messages.empty()) {
 			if (decoded.row_count != 0) {
 				throw InvalidInputException("Distributed Paimon INSERT returned rows without commit messages");
 			}
-			ValidateTargetBaseline(context, *this);
 			return 0;
 		}
 		if (decoded.row_count == 0) {
 			throw InvalidInputException("Distributed Paimon INSERT returned commit messages without rows");
 		}
-		ValidateTargetBaseline(context, *this);
 		committer = CreateCommitter(transport, options, coordinator_commit_user, true);
 		commits.emplace(transport.commit_identifier, decoded.messages);
 	} catch (...) {
+		vane_guard.unlock();
 		BestEffortAbortMessages(transport, options, coordinator_commit_user, decoded.messages);
 		throw;
 	}
+	// The Vane-only catalog mutation lock binds the validated table UUID,
+	// schema, and snapshot to the path-based Paimon commit in this process.
 	// After this call begins, a failure can represent a successful catalog
 	// commit whose acknowledgement was lost. Retain its prepared artifacts.
 	auto commit_result = committer->FilterAndCommit(commits);

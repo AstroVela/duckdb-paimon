@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -52,6 +53,8 @@ def verify_extension_is_wheel_linked(connection: object) -> None:
 def exercise_local_fast_insert(connection: object) -> None:
     with tempfile.TemporaryDirectory(prefix="vane-paimon-local-insert-") as warehouse_text:
         warehouse = Path(warehouse_text).resolve()
+        uuidless_target = warehouse / "legacy.db/uuidless_target"
+        shutil.copytree(TABLE_PATH, uuidless_target)
         connection.execute(f"ATTACH {sql_string(warehouse)} AS local_pm (TYPE paimon)")
         connection.execute("CREATE SCHEMA local_pm.local_insert")
         connection.execute(
@@ -76,6 +79,14 @@ def exercise_local_fast_insert(connection: object) -> None:
             connection.execute("SELECT id, part, payload FROM local_pm.local_insert.target WHERE id = 12").fetchone(),
             (12, None, "local-partial"),
             "local-fast native partial-column Paimon INSERT",
+        )
+        connection.execute("INSERT INTO local_pm.legacy.uuidless_target VALUES ('local-fast', 9, 90, 99.5)")
+        require_equal(
+            connection.execute(
+                "SELECT count(*)::BIGINT, max(f1), max(f2), max(f3) " "FROM local_pm.legacy.uuidless_target"
+            ).fetchone(),
+            (10, 9, 90, 99.5),
+            "local-fast native INSERT into a UUID-less Paimon table",
         )
 
 

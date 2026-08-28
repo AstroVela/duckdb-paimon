@@ -66,6 +66,7 @@ public:
 	vector<LogicalType> distributed_input_types;
 	vector<string> distributed_input_names;
 	map<string, string> distributed_portable_options;
+	optional_ptr<ClientContext> distributed_context;
 	string distributed_null_part_name;
 	int64_t distributed_schema_id = -1;
 	int64_t distributed_commit_identifier = 0;
@@ -102,6 +103,7 @@ public:
 	                                 OperatorSourceInput &input) const override;
 
 #ifdef PAIMON_VANE_DISTRIBUTED
+	void SetDistributedWriteContext(ClientContext &context);
 	void InitializeDistributedWrite(ClientContext &context, const vector<LogicalType> &input_types);
 	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override;
 	const distributed::DistributedExtensionWritePlan &WritePlan() const override;

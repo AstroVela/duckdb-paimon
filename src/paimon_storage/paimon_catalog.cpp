@@ -55,6 +55,13 @@ namespace duckdb {
 static constexpr const char *S3_PATH_PREFIX = "s3://";
 static constexpr const char *OSS_PATH_PREFIX = "oss://";
 
+#ifdef PAIMON_VANE_DISTRIBUTED
+std::mutex &PaimonCatalog::GetVaneCatalogMutationMutex() {
+	static std::mutex mutation_mutex;
+	return mutation_mutex;
+}
+#endif
+
 static std::optional<string> TryGetPaimonOptionValue(const unordered_map<string, Value> &input_options,
                                                      const string &key) {
 	for (const auto &entry : input_options) {
@@ -265,6 +272,9 @@ string PaimonCatalog::GetCatalogType() {
 }
 
 optional_ptr<CatalogEntry> PaimonCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
+#ifdef PAIMON_VANE_DISTRIBUTED
+	std::lock_guard<std::mutex> vane_guard(GetVaneCatalogMutationMutex());
+#endif
 	bool ignore_if_exists = info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT;
 	auto status = paimon_catalog->CreateDatabase(info.schema, {}, ignore_if_exists);
 	if (!status.ok()) {
@@ -353,7 +363,7 @@ PhysicalOperator &PaimonCatalog::PlanInsert(ClientContext &context, PhysicalPlan
 	}
 #ifdef PAIMON_VANE_DISTRIBUTED
 	if (plan) {
-		insert.Cast<PhysicalPaimonInsert>().InitializeDistributedWrite(context, insert.children[0].get().types);
+		insert.Cast<PhysicalPaimonInsert>().SetDistributedWriteContext(context);
 	}
 #endif
 	return insert;
@@ -383,6 +393,9 @@ ErrorData PaimonCatalog::SupportsCreateTable(BoundCreateTableInfo &info) {
 }
 
 void PaimonCatalog::DropSchema(ClientContext &context, DropInfo &info) {
+#ifdef PAIMON_VANE_DISTRIBUTED
+	std::lock_guard<std::mutex> vane_guard(GetVaneCatalogMutationMutex());
+#endif
 	bool ignore_if_not_exists = info.if_not_found == OnEntryNotFound::RETURN_NULL;
 	auto status = paimon_catalog->DropDatabase(info.name, ignore_if_not_exists, info.cascade);
 	if (!status.ok()) {
