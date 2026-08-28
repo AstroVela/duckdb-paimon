@@ -399,6 +399,22 @@ static PaimonDistributedCommitEnvelope DeserializeCommitEnvelope(const string &b
 	return result;
 }
 
+static string LoadTableUUID(paimon::Catalog &catalog, const paimon::Identifier &table_identifier) {
+	auto table_result = catalog.GetTable(table_identifier);
+	if (!table_result.ok()) {
+		throw IOException(table_result.status().ToString());
+	}
+	auto table = std::move(table_result).value();
+	if (!table) {
+		throw IOException("Paimon table %s has no stable table identity", table_identifier.ToString());
+	}
+	auto table_uuid = table->Uuid();
+	if (table_uuid.empty()) {
+		throw IOException("Paimon table %s has an empty table UUID", table_identifier.ToString());
+	}
+	return table_uuid;
+}
+
 static PaimonDistributedTargetState LoadTargetState(PaimonCatalog &catalog,
                                                     const paimon::Identifier &table_identifier) {
 	auto &paimon_catalog = catalog.GetPaimonCatalog();
@@ -411,18 +427,7 @@ static PaimonDistributedTargetState LoadTargetState(PaimonCatalog &catalog,
 	}
 
 	PaimonDistributedTargetState result;
-	auto table_result = paimon_catalog.GetTable(table_identifier);
-	if (!table_result.ok()) {
-		throw IOException(table_result.status().ToString());
-	}
-	auto table = std::move(table_result).value();
-	if (!table) {
-		throw IOException("Paimon table %s has no stable table identity", table_identifier.ToString());
-	}
-	result.table_uuid = table->Uuid();
-	if (result.table_uuid.empty()) {
-		throw IOException("Paimon table %s has an empty table UUID", table_identifier.ToString());
-	}
+	result.table_uuid = LoadTableUUID(paimon_catalog, table_identifier);
 
 	auto path_result = paimon_catalog.GetTableLocation(table_identifier);
 	if (!path_result.ok()) {
@@ -463,6 +468,10 @@ static PaimonDistributedTargetState LoadTargetState(PaimonCatalog &catalog,
 	if (!snapshots.empty()) {
 		result.has_snapshot = true;
 		result.snapshot_id = snapshots.back().snapshot_id;
+	}
+	if (LoadTableUUID(paimon_catalog, table_identifier) != result.table_uuid) {
+		throw TransactionException("Paimon table %s was replaced while resolving the distributed INSERT target",
+		                           table_identifier.ToString());
 	}
 	return result;
 }
