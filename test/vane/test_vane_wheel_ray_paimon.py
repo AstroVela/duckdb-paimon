@@ -39,6 +39,12 @@ CONFLICT_INSERT_TARGET = "pm.vane_ray.conflict_insert_target"
 SCHEMA_CONFLICT_INSERT_TARGET = "pm.vane_ray.schema_conflict_insert_target"
 ATTEMPT_METADATA_INSERT_TARGET = "pm.vane_ray.attempt_metadata_insert_target"
 TYPE_BASELINE_INSERT_TARGET = "pm.vane_ray.type_baseline_insert_target"
+CTAS_TARGET = "pm.vane_ray.ctas_target"
+DUPLICATE_CTAS_TARGET = "pm.vane_ray.duplicate_ctas_target"
+PARTITIONED_CTAS_TARGET = "pm.vane_ray.partitioned_ctas_target"
+EMPTY_CTAS_TARGET = "pm.vane_ray.empty_ctas_target"
+FAILURE_CTAS_TARGET = "pm.vane_ray.failure_ctas_target"
+CONFLICT_CTAS_TARGET = "pm.vane_ray.conflict_ctas_target"
 
 
 def require_equal(actual: object, expected: object, description: str) -> None:
@@ -310,6 +316,7 @@ class RayPaimonHarness:
         operation: Callable[[], object],
         expected_rows: int,
         minimum_task_results: int,
+        expected_write_name: str = "insert",
     ) -> dict[str, object]:
         previous_count = self.write_dispatch_count
         self.last_write_result = None
@@ -321,7 +328,7 @@ class RayPaimonHarness:
         require_equal(result.get("extension_write"), True, f"{description} extension write marker")
         require_equal(
             result.get("extension_write_name"),
-            "insert",
+            expected_write_name,
             f"{description} extension write name",
         )
         require_equal(
@@ -425,6 +432,12 @@ def create_paimon_fixture(connection: object, warehouse: Path) -> tuple[Path, Pa
         SCHEMA_CONFLICT_INSERT_TARGET: warehouse / "vane_ray.db/schema_conflict_insert_target",
         ATTEMPT_METADATA_INSERT_TARGET: warehouse / "vane_ray.db/attempt_metadata_insert_target",
         TYPE_BASELINE_INSERT_TARGET: warehouse / "vane_ray.db/type_baseline_insert_target",
+        CTAS_TARGET: warehouse / "vane_ray.db/ctas_target",
+        DUPLICATE_CTAS_TARGET: warehouse / "vane_ray.db/duplicate_ctas_target",
+        PARTITIONED_CTAS_TARGET: warehouse / "vane_ray.db/partitioned_ctas_target",
+        EMPTY_CTAS_TARGET: warehouse / "vane_ray.db/empty_ctas_target",
+        FAILURE_CTAS_TARGET: warehouse / "vane_ray.db/failure_ctas_target",
+        CONFLICT_CTAS_TARGET: warehouse / "vane_ray.db/conflict_ctas_target",
     }
     return (
         multi_path,
@@ -610,6 +623,111 @@ def exercise_distributed_inserts(
     )
 
 
+def exercise_distributed_ctas(
+    harness: RayPaimonHarness,
+    multi_path: Path,
+    target_paths: dict[str, Path],
+) -> None:
+    connection = harness.connection
+    harness.require_write(
+        "unpartitioned distributed Paimon CTAS",
+        lambda: source_insert_relation(harness, multi_path).create(CTAS_TARGET),
+        expected_rows=80,
+        minimum_task_results=2,
+        expected_write_name="ctas",
+    )
+    require_equal(snapshot_count(connection, target_paths[CTAS_TARGET]), 1, "unpartitioned CTAS snapshots")
+    harness.require_query(
+        f"SELECT count(*)::BIGINT, sum(id)::BIGINT FROM {CTAS_TARGET}",
+        [(80, 3160)],
+        "unpartitioned distributed CTAS result",
+    )
+
+    # DuckDB chooses its ordinary PhysicalCreateTable operator when a target is
+    # already visible during physical planning. Freeze the extension CTAS plan
+    # while the target is absent, then publish the competing table before Vane
+    # preparation to exercise the coordinator-owned duplicate race directly.
+    from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
+    from vane.runners.local.runner import _InProcessFragmentExecutor
+
+    duplicate_logical_plan = harness.capture_write_plan(
+        lambda: source_insert_relation(harness, multi_path).create(DUPLICATE_CTAS_TARGET)
+    )
+    duplicate_physical_plan = duplicate_logical_plan.to_physical_plan(connection)
+    connection.execute(f"CREATE TABLE {DUPLICATE_CTAS_TARGET} (id INTEGER, part INTEGER, payload VARCHAR)")
+    executor = _InProcessFragmentExecutor()
+    backend = NativeFteWorkerManagerBackend(
+        execute_fn=executor,
+        num_workers=WORKER_COUNT,
+        max_running_tasks=WORKER_COUNT,
+    )
+    submit_calls = 0
+    original_submit_tasks = backend.submit_tasks
+
+    def count_duplicate_tasks(tasks: object) -> list[object]:
+        nonlocal submit_calls
+        submit_calls += 1
+        return list(original_submit_tasks(tasks))
+
+    backend.submit_tasks = count_duplicate_tasks
+    duplicate_plan_runner = harness.vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    try:
+        require_error(
+            "duplicate distributed Paimon CTAS preparation",
+            lambda: duplicate_plan_runner.run_copy_plan(duplicate_physical_plan, connection),
+            "already exists before distributed CTAS preparation",
+        )
+        require_equal(submit_calls, 0, "duplicate CTAS worker submissions")
+    finally:
+        try:
+            backend.shutdown()
+        finally:
+            executor.close()
+    require_equal(snapshot_count(connection, target_paths[DUPLICATE_CTAS_TARGET]), 0, "duplicate CTAS snapshots")
+    require_equal(
+        connection.execute(f"SELECT count(*)::BIGINT FROM {DUPLICATE_CTAS_TARGET}").fetchone(),
+        (0,),
+        "duplicate CTAS retained the competing table",
+    )
+
+    harness.require_write(
+        "partitioned distributed Paimon CTAS",
+        lambda: source_insert_relation(harness, multi_path).create(
+            PARTITIONED_CTAS_TARGET,
+            properties={"partition.default-name": "ctas-null"},
+            partition_by=["part"],
+        ),
+        expected_rows=80,
+        minimum_task_results=2,
+        expected_write_name="ctas",
+    )
+    require_equal(
+        snapshot_count(connection, target_paths[PARTITIONED_CTAS_TARGET]),
+        1,
+        "partitioned CTAS snapshots",
+    )
+    harness.require_query(
+        f"SELECT count(*)::BIGINT, min(id), max(id), sum(id)::BIGINT " f"FROM {PARTITIONED_CTAS_TARGET} WHERE part = 6",
+        [(10, 42, 78, 600)],
+        "partitioned distributed CTAS result",
+    )
+
+    empty_source = connection.sql(f"SELECT id, part, payload FROM paimon_scan({sql_string(multi_path)}) WHERE id < 0")
+    harness.require_write(
+        "empty distributed Paimon CTAS",
+        lambda: empty_source.create(EMPTY_CTAS_TARGET),
+        expected_rows=0,
+        minimum_task_results=1,
+        expected_write_name="ctas",
+    )
+    require_equal(snapshot_count(connection, target_paths[EMPTY_CTAS_TARGET]), 0, "empty CTAS snapshots")
+    require_equal(
+        connection.execute(f"SELECT count(*)::BIGINT FROM {EMPTY_CTAS_TARGET}").fetchone(),
+        (0,),
+        "empty distributed CTAS result",
+    )
+
+
 def exercise_duplicate_retry_attempt_metadata(
     harness: RayPaimonHarness,
     multi_path: Path,
@@ -785,6 +903,70 @@ def exercise_worker_failure_and_retry(
     )
 
 
+def exercise_ctas_worker_failure_and_explicit_retry(
+    harness: RayPaimonHarness,
+    multi_path: Path,
+    target_path: Path,
+) -> None:
+    vane = harness.vane
+    relation = source_insert_relation(harness, multi_path).map_batches(
+        FailSelectedPaimonWorker,
+        schema={
+            "id": vane.sqltype("INTEGER"),
+            "part": vane.sqltype("INTEGER"),
+            "payload": vane.sqltype("VARCHAR"),
+        },
+        batch_size=8,
+        cpus=1.0,
+        execution_backend="ray_actor",
+        actor_number=WORKER_COUNT,
+        target_max_batch_bytes=4096,
+    )
+    previous_count = harness.write_dispatch_count
+    require_error(
+        "distributed Paimon CTAS worker failure",
+        lambda: relation.create(FAILURE_CTAS_TARGET),
+        "intentional distributed Paimon worker failure",
+    )
+    require_equal(harness.write_dispatch_count, previous_count + 1, "CTAS worker failure Ray dispatch")
+    require_true(target_path.exists(), "CTAS worker failure did not retain the prepared table")
+    require_equal(snapshot_count(harness.connection, target_path), 0, "CTAS worker failure snapshots")
+    require_equal(
+        harness.connection.execute(f"SELECT count(*)::BIGINT FROM {FAILURE_CTAS_TARGET}").fetchone(),
+        (0,),
+        "CTAS worker failure retained an empty table",
+    )
+    require_true(bool(vane_attempt_artifacts(target_path)), "CTAS worker failure did not retain orphan artifacts")
+
+    # The retained schema-0 table is visible before a retry is physically
+    # planned. DuckDB therefore selects its ordinary CREATE_TABLE operator,
+    # which Vane rejects before any extension callback or worker scheduling.
+    # The prepare-race path owned by this extension is covered separately.
+    previous_count = harness.write_dispatch_count
+    require_error(
+        "distributed Paimon CTAS retry without cleanup",
+        lambda: source_insert_relation(harness, multi_path).create(FAILURE_CTAS_TARGET),
+        "Distributed pipeline does not support operator type: CREATE_TABLE",
+    )
+    require_equal(harness.write_dispatch_count, previous_count + 1, "unclean CTAS retry Ray dispatch")
+
+    harness.connection.execute(f"DROP TABLE {FAILURE_CTAS_TARGET}")
+    require_true(not target_path.exists(), "explicit CTAS cleanup did not remove the retained table")
+    harness.require_write(
+        "distributed Paimon CTAS retry after explicit cleanup",
+        lambda: source_insert_relation(harness, multi_path).create(FAILURE_CTAS_TARGET),
+        expected_rows=80,
+        minimum_task_results=2,
+        expected_write_name="ctas",
+    )
+    require_equal(snapshot_count(harness.connection, target_path), 1, "clean CTAS retry snapshots")
+    require_equal(
+        harness.connection.execute(f"SELECT count(*)::BIGINT, sum(id)::BIGINT FROM {FAILURE_CTAS_TARGET}").fetchone(),
+        (80, 3160),
+        "clean CTAS retry result",
+    )
+
+
 def run_blocked_distributed_insert(
     harness: RayPaimonHarness,
     multi_path: Path,
@@ -856,6 +1038,105 @@ def run_blocked_distributed_insert(
         raise coordination_error
     require_equal(harness.write_dispatch_count, previous_count + 1, f"{description} Ray dispatch")
     return errors
+
+
+def exercise_ctas_coordinator_validation_and_explicit_retry(
+    harness: RayPaimonHarness,
+    multi_path: Path,
+    target_path: Path,
+) -> None:
+    marker = uuid.uuid4().hex
+    started_path = target_path.parent.parent / f".vane-paimon-ctas-{marker}-started"
+    release_path = target_path.parent.parent / f".vane-paimon-ctas-{marker}-release"
+
+    class ConfiguredWaitForPaimonCTASConflict(WaitForPaimonTargetConflict):
+        pass
+
+    ConfiguredWaitForPaimonCTASConflict.started_path = str(started_path)
+    ConfiguredWaitForPaimonCTASConflict.release_path = str(release_path)
+    relation = source_insert_relation(harness, multi_path).map_batches(
+        ConfiguredWaitForPaimonCTASConflict,
+        schema={
+            "id": harness.vane.sqltype("INTEGER"),
+            "part": harness.vane.sqltype("INTEGER"),
+            "payload": harness.vane.sqltype("VARCHAR"),
+        },
+        batch_size=8,
+        cpus=1.0,
+        execution_backend="ray_actor",
+        actor_number=WORKER_COUNT,
+        target_max_batch_bytes=4096,
+    )
+    errors: list[BaseException] = []
+    previous_count = harness.write_dispatch_count
+
+    def execute_distributed_ctas() -> None:
+        try:
+            relation.create(CONFLICT_CTAS_TARGET)
+        except BaseException as error:
+            errors.append(error)
+
+    write_thread = threading.Thread(
+        target=execute_distributed_ctas,
+        name="vane-paimon-ctas-coordinator-conflict",
+        daemon=True,
+    )
+    write_thread.start()
+    coordination_error: BaseException | None = None
+    try:
+        deadline = time.monotonic() + 90
+        while not started_path.exists():
+            if not write_thread.is_alive():
+                if errors:
+                    raise AssertionError(f"CTAS failed before worker execution: {errors[0]!r}") from errors[0]
+                raise AssertionError("CTAS stopped before worker execution")
+            if time.monotonic() >= deadline:
+                raise AssertionError("timed out waiting for distributed CTAS worker execution")
+            time.sleep(0.05)
+
+        require_true(target_path.exists(), "distributed CTAS did not prepare its table before worker execution")
+        schema_directory = target_path / "schema"
+        schema = json.loads((schema_directory / "schema-0").read_text(encoding="utf-8"))
+        schema["id"] = 1
+        schema["timeMillis"] = int(schema["timeMillis"]) + 1
+        temporary_path = schema_directory / f".schema-1-{uuid.uuid4().hex}"
+        temporary_path.write_text(json.dumps(schema, indent=4) + "\n", encoding="utf-8")
+        temporary_path.replace(schema_directory / "schema-1")
+    except BaseException as error:
+        coordination_error = error
+    finally:
+        release_path.touch()
+
+    write_thread.join(timeout=120)
+    started_path.unlink(missing_ok=True)
+    release_path.unlink(missing_ok=True)
+    if write_thread.is_alive():
+        raise AssertionError("distributed Paimon CTAS coordinator-conflict write did not stop")
+    if coordination_error is not None:
+        raise coordination_error
+    require_equal(harness.write_dispatch_count, previous_count + 1, "CTAS coordinator conflict Ray dispatch")
+    require_equal(len(errors), 1, "CTAS coordinator conflict failure count")
+    if not error_chain_contains(errors[0], "schema changed after the distributed CTAS was planned"):
+        raise AssertionError(f"CTAS coordinator conflict returned the wrong error: {errors[0]!r}") from errors[0]
+    require_true(target_path.exists(), "CTAS coordinator failure did not retain the prepared table")
+    require_equal(snapshot_count(harness.connection, target_path), 0, "CTAS coordinator failure snapshots")
+    require_equal(vane_attempt_artifacts(target_path), [], "CTAS coordinator failure artifact cleanup")
+    require_equal(
+        harness.connection.execute(f"SELECT count(*)::BIGINT FROM {CONFLICT_CTAS_TARGET}").fetchone(),
+        (0,),
+        "CTAS coordinator failure retained an empty table",
+    )
+
+    harness.connection.execute(f"DROP TABLE {CONFLICT_CTAS_TARGET}")
+    require_true(not target_path.exists(), "explicit CTAS conflict cleanup did not remove the retained table")
+    harness.require_write(
+        "distributed Paimon CTAS retry after coordinator failure cleanup",
+        lambda: source_insert_relation(harness, multi_path).create(CONFLICT_CTAS_TARGET),
+        expected_rows=80,
+        minimum_task_results=2,
+        expected_write_name="ctas",
+    )
+    require_equal(snapshot_count(harness.connection, target_path), 1, "CTAS coordinator retry snapshots")
 
 
 def exercise_target_conflict_and_retry(
@@ -1128,6 +1409,17 @@ def main() -> None:
             exercise_worker_topology(harness, ray, expected_nodes, multi_path)
             exercise_fail_closed_payloads(harness, multi_path)
             exercise_distributed_inserts(harness, multi_path, target_paths)
+            exercise_distributed_ctas(harness, multi_path, target_paths)
+            exercise_ctas_worker_failure_and_explicit_retry(
+                harness,
+                multi_path,
+                target_paths[FAILURE_CTAS_TARGET],
+            )
+            exercise_ctas_coordinator_validation_and_explicit_retry(
+                harness,
+                multi_path,
+                target_paths[CONFLICT_CTAS_TARGET],
+            )
             exercise_duplicate_retry_attempt_metadata(
                 harness,
                 multi_path,
@@ -1158,7 +1450,7 @@ def main() -> None:
                 "Ray suite did not exercise enough reads",
             )
             require_true(
-                harness.write_dispatch_count >= 9,
+                harness.write_dispatch_count >= 18,
                 "Ray suite did not exercise enough writes",
             )
     finally:

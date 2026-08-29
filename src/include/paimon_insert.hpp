@@ -62,9 +62,12 @@ public:
 	string distributed_operation_id;
 	string distributed_table_uuid;
 	string distributed_table_path;
-	string distributed_table_schema_json;
+	string distributed_schema_fingerprint;
+	mutable string distributed_table_schema_json;
 	vector<LogicalType> distributed_input_types;
 	vector<string> distributed_input_names;
+	vector<string> distributed_primary_keys;
+	map<string, string> distributed_table_options;
 	map<string, string> distributed_portable_options;
 	optional_ptr<ClientContext> distributed_context;
 	string distributed_null_part_name;
@@ -75,6 +78,8 @@ public:
 	int64_t distributed_snapshot_id = 0;
 	bool distributed_target_initialized = false;
 	bool distributed_worker_plan_selected = false;
+	mutable bool distributed_prepare_started = false;
+	mutable bool distributed_target_prepared = false;
 	mutable bool distributed_finalize_started = false;
 #endif
 
@@ -108,6 +113,7 @@ public:
 	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override;
 	const distributed::DistributedExtensionWritePlan &WritePlan() const override;
 	void ValidateDistributedWrite(ClientContext &context) const override;
+	void PrepareDistributedWrite(ClientContext &context) const override;
 	idx_t FinalizeDistributedWrite(ClientContext &context,
 	                               const vector<DistributedWriteTaskResult> &results) const override;
 	void AbortDistributedWrite(ClientContext &context,

@@ -328,6 +328,9 @@ PhysicalOperator &PaimonCatalog::PlanCreateTableAs(ClientContext &context, Physi
 	auto &insert = planner.Make<PhysicalPaimonInsert>(op, op.schema, std::move(op.info), std::move(table_identifier),
 	                                                  std::move(paimon_options), std::move(part_keys), 0U);
 	insert.children.push_back(plan);
+#ifdef PAIMON_VANE_DISTRIBUTED
+	insert.Cast<PhysicalPaimonInsert>().SetDistributedWriteContext(context);
+#endif
 	return insert;
 }
 
