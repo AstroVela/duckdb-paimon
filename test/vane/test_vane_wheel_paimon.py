@@ -67,6 +67,11 @@ def exercise_local_fast_insert(connection: object) -> None:
         )
         source.insert_into("local_pm.local_insert.target")
         connection.execute("INSERT INTO local_pm.local_insert.target (id, payload) " "VALUES (12, 'local-partial')")
+        source.create(
+            "local_pm.local_insert.ctas_target",
+            properties={"partition.default-name": "local-null"},
+            partition_by=["part"],
+        )
         require_equal(
             connection.execute(
                 "SELECT count(*)::BIGINT, sum(id)::BIGINT, count(DISTINCT part)::BIGINT "
@@ -74,6 +79,14 @@ def exercise_local_fast_insert(connection: object) -> None:
             ).fetchone(),
             (13, 78, 3),
             "local-fast native Paimon INSERT",
+        )
+        require_equal(
+            connection.execute(
+                "SELECT count(*)::BIGINT, sum(id)::BIGINT, count(DISTINCT part)::BIGINT "
+                "FROM local_pm.local_insert.ctas_target"
+            ).fetchone(),
+            (12, 66, 3),
+            "local-fast native Paimon CTAS",
         )
         require_equal(
             connection.execute("SELECT id, part, payload FROM local_pm.local_insert.target WHERE id = 12").fetchone(),

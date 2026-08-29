@@ -271,8 +271,22 @@ make vane_ci VANE_BUILD_JOBS=8
 make vane_wheel VANE_BUILD_JOBS=8
 ```
 
-The initial Vane lane validates the isolated build and the existing native
-Paimon scan path. Distributed scan and write behavior is added separately.
+The Vane lane validates packaged native behavior plus distributed Paimon
+scans, `INSERT`, and `CREATE TABLE AS` through a two-worker Ray runtime.
+Distributed writes currently support append-only tables. For CTAS, the
+coordinator creates and validates the empty schema-0 table before workers open
+their path-based writers, so the catalog must resolve the target location
+before table creation.
+
+The distributed write execution contract matches the Iceberg integration:
+workers return strict, attempt-scoped commit fragments and the coordinator
+commits the selected `CommitMessage`s once. A known failure before coordinator
+finalization best-effort aborts only the messages that reached the coordinator;
+CTAS keeps its prepared empty table. Once finalization begins, a failed commit
+has an unknown outcome and the table and artifacts are retained. Files without
+an available `CommitMessage` are left to Paimon's orphan-files garbage
+collection. Retry a failed CTAS only after explicitly dropping or otherwise
+cleaning its retained target.
 
 ### Running the Tests
 
