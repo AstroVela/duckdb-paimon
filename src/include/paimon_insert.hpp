@@ -26,6 +26,9 @@
 
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
+#ifdef PAIMON_VANE_DISTRIBUTED
+#include "duckdb/execution/distributed/extension_write_task_provider.hpp"
+#endif
 #include "paimon/catalog/identifier.h"
 
 #include <map>
@@ -35,7 +38,12 @@ namespace duckdb {
 
 class SchemaCatalogEntry;
 
-class PhysicalPaimonInsert : public PhysicalOperator {
+class PhysicalPaimonInsert : public PhysicalOperator
+#ifdef PAIMON_VANE_DISTRIBUTED
+    ,
+                             public distributed::ExtensionWriteTaskProvider
+#endif
+{
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
@@ -48,6 +56,27 @@ public:
 	paimon::Identifier table_identifier;
 	map<string, string> paimon_options;
 	vector<string> part_keys;
+
+#ifdef PAIMON_VANE_DISTRIBUTED
+	distributed::DistributedExtensionWritePlan distributed_write_plan;
+	string distributed_operation_id;
+	string distributed_table_uuid;
+	string distributed_table_path;
+	string distributed_table_schema_json;
+	vector<LogicalType> distributed_input_types;
+	vector<string> distributed_input_names;
+	map<string, string> distributed_portable_options;
+	optional_ptr<ClientContext> distributed_context;
+	string distributed_null_part_name;
+	int64_t distributed_schema_id = -1;
+	int64_t distributed_commit_identifier = 0;
+	bool distributed_append_only = false;
+	bool distributed_has_snapshot = false;
+	int64_t distributed_snapshot_id = 0;
+	bool distributed_target_initialized = false;
+	bool distributed_worker_plan_selected = false;
+	mutable bool distributed_finalize_started = false;
+#endif
 
 public:
 	bool IsSink() const override {
@@ -72,6 +101,19 @@ public:
 	}
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;
+
+#ifdef PAIMON_VANE_DISTRIBUTED
+	void SetDistributedWriteContext(ClientContext &context);
+	void InitializeDistributedWrite(ClientContext &context, const vector<LogicalType> &input_types);
+	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override;
+	const distributed::DistributedExtensionWritePlan &WritePlan() const override;
+	void ValidateDistributedWrite(ClientContext &context) const override;
+	idx_t FinalizeDistributedWrite(ClientContext &context,
+	                               const vector<DistributedWriteTaskResult> &results) const override;
+	void AbortDistributedWrite(ClientContext &context,
+	                           const vector<DistributedWriteTaskResult> &selected_results) const override;
+	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
+#endif
 };
 
 } // namespace duckdb

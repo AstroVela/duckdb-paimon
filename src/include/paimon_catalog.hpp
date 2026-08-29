@@ -33,6 +33,10 @@
 
 #include "paimon_schema_set.hpp"
 
+#ifdef PAIMON_VANE_DISTRIBUTED
+#include <mutex>
+#endif
+
 namespace duckdb {
 
 class PaimonCatalog : public Catalog {
@@ -96,6 +100,10 @@ public:
 	AccessMode GetAccessMode() const {
 		return access_mode;
 	}
+
+#ifdef PAIMON_VANE_DISTRIBUTED
+	static std::mutex &GetVaneCatalogMutationMutex();
+#endif
 
 	const string &GetPath() const {
 		return path;

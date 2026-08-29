@@ -273,6 +273,9 @@ SinkFinalizeType PhysicalPaimonInsert::Finalize(Pipeline &pipeline, Event &event
 		return SinkFinalizeType::READY;
 	}
 
+#ifdef PAIMON_VANE_DISTRIBUTED
+	std::lock_guard<std::mutex> vane_guard(PaimonCatalog::GetVaneCatalogMutationMutex());
+#endif
 	paimon::CommitContextBuilder commit_builder(gstate.table_path, "duckdb");
 	auto commit_ctx_result = commit_builder.SetOptions(paimon_options).Finish();
 	if (!commit_ctx_result.ok()) {

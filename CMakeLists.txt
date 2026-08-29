@@ -15,7 +15,8 @@ include_directories(src/include)
 option(PAIMON_VANE_DISTRIBUTED
        "Build the explicit Vane distributed Paimon interfaces" OFF)
 if(PAIMON_VANE_DISTRIBUTED)
-  if(NOT EXISTS "${DUCKDB_SOURCE_PATH}/src/include/duckdb/function/distributed_table_function.hpp")
+  if(NOT EXISTS "${DUCKDB_SOURCE_PATH}/src/include/duckdb/function/distributed_table_function.hpp" OR
+     NOT EXISTS "${DUCKDB_SOURCE_PATH}/src/include/duckdb/execution/distributed/extension_write_task_provider.hpp")
     message(FATAL_ERROR "PAIMON_VANE_DISTRIBUTED requires the Vane DuckDB source tree")
   endif()
   add_definitions(-DPAIMON_VANE_DISTRIBUTED)
@@ -148,7 +149,8 @@ set(EXTENSION_SOURCES
 
 if(PAIMON_VANE_DISTRIBUTED)
   list(APPEND EXTENSION_SOURCES
-       src/paimon_storage/paimon_distributed_scan.cpp)
+       src/paimon_storage/paimon_distributed_scan.cpp
+       src/paimon_storage/paimon_distributed_insert.cpp)
 endif()
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

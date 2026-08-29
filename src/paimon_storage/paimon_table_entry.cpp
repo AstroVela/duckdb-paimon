@@ -31,6 +31,12 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/tableref/bound_at_clause.hpp"
 
+#ifdef PAIMON_VANE_DISTRIBUTED
+#include "duckdb/common/crypto/md5.hpp"
+
+#include "paimon/catalog/table.h"
+#endif
+
 #include "paimon_catalog.hpp"
 
 namespace duckdb {
@@ -106,5 +112,51 @@ virtual_column_map_t PaimonTableEntry::GetVirtualColumns() const {
 vector<column_t> PaimonTableEntry::GetRowIdColumns() const {
 	return {};
 }
+
+#ifdef PAIMON_VANE_DISTRIBUTED
+string PaimonTableEntry::GetLogicalWriteTargetIdentity() const {
+	auto &paimon_catalog = catalog.Cast<PaimonCatalog>().GetPaimonCatalog();
+	paimon::Identifier identifier(schema.name, name);
+
+	auto table_result = paimon_catalog.GetTable(identifier);
+	if (!table_result.ok()) {
+		throw IOException(table_result.status().ToString());
+	}
+	auto table = std::move(table_result).value();
+	if (!table) {
+		throw IOException("Paimon table %s has no stable table identity", identifier.ToString());
+	}
+	auto table_uuid = table->Uuid();
+	if (table_uuid.empty()) {
+		throw IOException("Paimon table %s has an empty table UUID", identifier.ToString());
+	}
+	return table_uuid;
+}
+
+string PaimonTableEntry::GetLogicalWriteTargetDefinition(ClientContext &) {
+	auto &paimon_catalog = catalog.Cast<PaimonCatalog>().GetPaimonCatalog();
+	paimon::Identifier identifier(schema.name, name);
+	auto schema_result = paimon_catalog.LoadTableSchema(identifier);
+	if (!schema_result.ok()) {
+		throw IOException(schema_result.status().ToString());
+	}
+	auto table_schema = std::move(schema_result).value();
+	if (!table_schema) {
+		throw IOException("Paimon table %s has no write target definition", identifier.ToString());
+	}
+	auto schema_json_result = table_schema->GetJsonSchema();
+	if (!schema_json_result.ok()) {
+		throw IOException(schema_json_result.status().ToString());
+	}
+	auto schema_json = std::move(schema_json_result).value();
+	if (schema_json.empty()) {
+		throw IOException("Paimon table %s has an empty write target definition", identifier.ToString());
+	}
+
+	MD5Context digest;
+	digest.Add(schema_json);
+	return "paimon-write-definition:v1:" + digest.FinishHex();
+}
+#endif
 
 } // namespace duckdb
