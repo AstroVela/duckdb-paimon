@@ -27,8 +27,8 @@ from pathlib import Path
 from types import ModuleType
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-VANE_VERSION = "0.2.0.dev603"
-PAIMON_VERSION = "0.2.0.0.603.1"
+VANE_VERSION = "0.2.0.dev612"
+PAIMON_VERSION = "0.2.0.0.612.1"
 INTERPRETERS = ("cp310", "cp311", "cp312", "cp313", "cp314")
 PLATFORM = "manylinux_2_28_x86_64"
 
