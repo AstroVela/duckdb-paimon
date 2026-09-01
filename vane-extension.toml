@@ -6,4 +6,4 @@ native_test_selection = "test/sql/paimon_scan.test"
 
 [vane]
 repository = "AstroVela/vane"
-revision = "64ed91c7e7ea7791b93e81e98fac0e8dce5da4de"
+revision = "70fea3800ac8bec49e4b8b0edf95c93706f8b4aa"

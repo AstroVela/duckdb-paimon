@@ -1,0 +1,26 @@
+diff --git a/cmake_modules/SetupCxxFlags.cmake b/cmake_modules/SetupCxxFlags.cmake
+--- a/cmake_modules/SetupCxxFlags.cmake
++++ b/cmake_modules/SetupCxxFlags.cmake
+@@ -366,4 +366,6 @@ endif()
+ #   -O3: Enable all compiler optimizations
+ #   Debug symbols are stripped for reduced binary size. Add
+ #   -DPAIMON_CXXFLAGS="-g" to add them
++# For CMAKE_BUILD_TYPE=MinSizeRel
++#   -Os: Optimize for binary size without debug symbols
+ if(NOT MSVC)
+@@ -383,3 +385,5 @@ if(NOT MSVC)
+     set(C_FLAGS_RELEASE "-O3 -DNDEBUG")
+     set(CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
++    set(C_FLAGS_MINSIZEREL "-Os -DNDEBUG")
++    set(CXX_FLAGS_MINSIZEREL "-Os -DNDEBUG")
+ endif()
+@@ -395,6 +399,8 @@ if("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG")
+     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX_FLAGS_DEBUG}")
+ elseif("${CMAKE_BUILD_TYPE}" STREQUAL "RELWITHDEBINFO")
+-
++elseif("${CMAKE_BUILD_TYPE}" STREQUAL "MINSIZEREL" AND NOT MSVC)
++    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${C_FLAGS_MINSIZEREL}")
++    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX_FLAGS_MINSIZEREL}")
+ elseif("${CMAKE_BUILD_TYPE}" STREQUAL "FASTDEBUG")
+     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${C_FLAGS_FASTDEBUG}")
+     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX_FLAGS_FASTDEBUG}")

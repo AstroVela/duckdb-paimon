@@ -14,12 +14,22 @@ include_directories(src/include)
 
 option(PAIMON_VANE_DISTRIBUTED
        "Build the explicit Vane distributed Paimon interfaces" OFF)
+option(PAIMON_VANE_SELF_CONTAINED
+       "Build one self-contained Vane Paimon loadable extension" OFF)
 if(PAIMON_VANE_DISTRIBUTED)
   if(NOT EXISTS "${DUCKDB_SOURCE_PATH}/src/include/duckdb/function/distributed_table_function.hpp" OR
      NOT EXISTS "${DUCKDB_SOURCE_PATH}/src/include/duckdb/execution/distributed/extension_write_task_provider.hpp")
     message(FATAL_ERROR "PAIMON_VANE_DISTRIBUTED requires the Vane DuckDB source tree")
   endif()
   add_definitions(-DPAIMON_VANE_DISTRIBUTED)
+endif()
+if(PAIMON_VANE_SELF_CONTAINED AND NOT PAIMON_VANE_DISTRIBUTED)
+  message(FATAL_ERROR
+          "PAIMON_VANE_SELF_CONTAINED requires PAIMON_VANE_DISTRIBUTED")
+endif()
+if(PAIMON_VANE_SELF_CONTAINED AND (NOT UNIX OR APPLE))
+  message(FATAL_ERROR
+          "PAIMON_VANE_SELF_CONTAINED currently requires Linux")
 endif()
 
 # Import paimon-cpp as a subproject
@@ -43,6 +53,8 @@ set(PAIMON_CPP_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/paimon-cpp)
 set(PAIMON_CPP_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/paimon-cpp-install)
 set(PAIMON_CPP_INCLUDE ${PAIMON_CPP_PREFIX}/include)
 set(PAIMON_CPP_LIB ${PAIMON_CPP_PREFIX}/lib64)
+set(PAIMON_CPP_BUILD_DIR
+    ${CMAKE_CURRENT_BINARY_DIR}/paimon_cpp_ep-prefix/src/paimon_cpp_ep-build)
 file(MAKE_DIRECTORY ${PAIMON_CPP_INCLUDE})
 
 # paimon-cpp's bundled AWS projects install package metadata below lib64 while
@@ -59,7 +71,8 @@ if(PAIMON_VANE_DISTRIBUTED AND UNIX AND NOT APPLE)
 endif()
 
 set(PAIMON_CPP_PATCHES
-  ${CMAKE_CURRENT_SOURCE_DIR}/patches/paimon-cpp-install-arrow-headers.patch)
+  ${CMAKE_CURRENT_SOURCE_DIR}/patches/paimon-cpp-install-arrow-headers.patch
+  ${CMAKE_CURRENT_SOURCE_DIR}/patches/paimon-cpp-min-size-rel.patch)
 
 # Build patch command: apply each patch idempotently
 set(PAIMON_CPP_PATCH_SCRIPT "")
@@ -83,47 +96,127 @@ if(CMAKE_TOOLCHAIN_FILE AND DEFINED VCPKG_TARGET_TRIPLET AND DEFINED VCPKG_INSTA
     list(APPEND PAIMON_CPP_VCPKG_LIBS CURL::libcurl OpenSSL::SSL OpenSSL::Crypto)
   endif()
 endif()
+if(PAIMON_VANE_SELF_CONTAINED AND NOT PAIMON_CPP_VCPKG_LIBS)
+  message(FATAL_ERROR
+          "PAIMON_VANE_SELF_CONTAINED requires the pinned vcpkg toolchain")
+endif()
+
+set(PAIMON_CPP_COMPONENT_NAMES
+    paimon
+    paimon_file_index
+    paimon_global_index
+    paimon_local_file_system
+    paimon_s3_file_system
+    paimon_parquet_file_format
+    paimon_orc_file_format
+    paimon_avro_file_format
+    paimon_blob_file_format)
+
+if(PAIMON_VANE_SELF_CONTAINED)
+  set(PAIMON_CPP_BUILD_SHARED OFF)
+  set(PAIMON_CPP_BUILD_STATIC ON)
+  # Keep the signed provider below Vane's artifact limit without weakening its
+  # self-contained dependency boundary. MinSizeRel propagates through
+  # paimon-cpp's bundled ExternalProjects while retaining release semantics.
+  set(PAIMON_CPP_BUILD_TYPE MinSizeRel)
+  string(TOLOWER "${PAIMON_CPP_BUILD_TYPE}" PAIMON_CPP_BUILD_SUBDIR)
+  set(PAIMON_CPP_SELF_CONTAINED_CMAKE_ARGS
+      "-DPAIMON_CXXFLAGS=-ffunction-sections -fdata-sections")
+  # JindoSDK distributes only a shared C runtime. Exclude it from the provider
+  # build so the signed artifact has no package-local DSO dependency.
+  set(PAIMON_CPP_ENABLE_JINDO OFF)
+
+  set(PAIMON_CPP_STATIC_COMPONENT_LIBS)
+  foreach(component IN LISTS PAIMON_CPP_COMPONENT_NAMES)
+    list(APPEND PAIMON_CPP_STATIC_COMPONENT_LIBS
+         ${PAIMON_CPP_LIB}/lib${component}${CMAKE_STATIC_LIBRARY_SUFFIX})
+  endforeach()
+  set(PAIMON_CPP_STATIC_DEPENDENCY_LIBS
+      ${PAIMON_CPP_BUILD_DIR}/arrow_ep-install/lib/libarrow.a
+      ${PAIMON_CPP_BUILD_DIR}/arrow_ep-install/lib/libarrow_acero.a
+      ${PAIMON_CPP_BUILD_DIR}/arrow_ep-install/lib/libarrow_dataset.a
+      ${PAIMON_CPP_BUILD_DIR}/arrow_ep-install/lib/libparquet.a
+      ${PAIMON_CPP_BUILD_DIR}/arrow_ep-install/lib/libarrow_bundled_dependencies.a
+      ${PAIMON_CPP_BUILD_DIR}/avro_ep-install/lib/libavrocpp_s.a
+      ${PAIMON_CPP_BUILD_DIR}/aws-auth_ep-install/lib64/libaws-c-auth.a
+      ${PAIMON_CPP_BUILD_DIR}/aws-auth_ep-install/lib64/libaws-c-cal.a
+      ${PAIMON_CPP_BUILD_DIR}/aws-auth_ep-install/lib64/libaws-c-common.a
+      ${PAIMON_CPP_BUILD_DIR}/aws-auth_ep-install/lib64/libaws-c-compression.a
+      ${PAIMON_CPP_BUILD_DIR}/aws-auth_ep-install/lib64/libaws-c-http.a
+      ${PAIMON_CPP_BUILD_DIR}/aws-auth_ep-install/lib64/libaws-c-io.a
+      ${PAIMON_CPP_BUILD_DIR}/aws-auth_ep-install/lib64/libaws-c-sdkutils.a
+      ${PAIMON_CPP_BUILD_DIR}/aws-auth_ep-install/lib64/libs2n.a
+      ${PAIMON_CPP_BUILD_DIR}/fmt_ep-install/lib/libfmt.a
+      ${PAIMON_CPP_BUILD_DIR}/glog_ep-install/lib/libglog.a
+      ${PAIMON_CPP_BUILD_DIR}/lz4_ep-install/lib/liblz4.a
+      ${PAIMON_CPP_BUILD_DIR}/orc_ep-prefix/lib/liborc.a
+      ${PAIMON_CPP_BUILD_DIR}/protobuf_ep-install/lib/libprotobuf.a
+      ${PAIMON_CPP_BUILD_DIR}/re2_ep-install/lib/libre2.a
+      ${PAIMON_CPP_BUILD_DIR}/${PAIMON_CPP_BUILD_SUBDIR}/libroaring_bitmap.a
+      ${PAIMON_CPP_BUILD_DIR}/${PAIMON_CPP_BUILD_SUBDIR}/libxxhash.a
+      ${PAIMON_CPP_BUILD_DIR}/snappy_ep-install/lib/libsnappy.a
+      ${PAIMON_CPP_BUILD_DIR}/tbb_ep-install/lib/libtbb.a
+      ${PAIMON_CPP_BUILD_DIR}/zlib_ep-install/lib/libz.a
+      ${PAIMON_CPP_BUILD_DIR}/zstd_ep-install/lib/libzstd.a)
+  set(PAIMON_CPP_VCPKG_STATIC_LIBS
+      ${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/libcurl.a
+      ${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/libssl.a
+      ${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/libcrypto.a
+      ${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/libz.a)
+  set(PAIMON_CPP_BUILD_BYPRODUCTS
+      ${PAIMON_CPP_STATIC_COMPONENT_LIBS}
+      ${PAIMON_CPP_STATIC_DEPENDENCY_LIBS})
+else()
+  set(PAIMON_CPP_BUILD_SHARED ON)
+  set(PAIMON_CPP_BUILD_STATIC OFF)
+  set(PAIMON_CPP_BUILD_TYPE ${CMAKE_BUILD_TYPE})
+  set(PAIMON_CPP_ENABLE_JINDO ON)
+  set(PAIMON_CPP_BUILD_BYPRODUCTS
+      ${PAIMON_CPP_LIB}/libpaimon${CMAKE_SHARED_LIBRARY_SUFFIX}
+      ${PAIMON_CPP_LIB}/libpaimon_file_index${CMAKE_SHARED_LIBRARY_SUFFIX}
+      ${PAIMON_CPP_LIB}/libpaimon_global_index${CMAKE_SHARED_LIBRARY_SUFFIX}
+      ${PAIMON_CPP_LIB}/libpaimon_local_file_system${CMAKE_SHARED_LIBRARY_SUFFIX}
+      ${PAIMON_CPP_LIB}/libpaimon_jindo_file_system${CMAKE_SHARED_LIBRARY_SUFFIX}
+      ${PAIMON_CPP_LIB}/libpaimon_s3_file_system${CMAKE_SHARED_LIBRARY_SUFFIX}
+      ${PAIMON_CPP_LIB}/${JINDOSDK_C_INSTALLED_NAME}
+      ${PAIMON_CPP_LIB}/libpaimon_parquet_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
+      ${PAIMON_CPP_LIB}/libpaimon_orc_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
+      ${PAIMON_CPP_LIB}/libpaimon_avro_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
+      ${PAIMON_CPP_LIB}/libpaimon_blob_file_format${CMAKE_SHARED_LIBRARY_SUFFIX})
+endif()
 
 ExternalProject_Add(paimon_cpp_ep
   SOURCE_DIR ${PAIMON_CPP_SOURCE_DIR}
+  BINARY_DIR ${PAIMON_CPP_BUILD_DIR}
   PATCH_COMMAND
     sh -c "${PAIMON_CPP_PATCH_SCRIPT}"
   CMAKE_ARGS
-    -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+    -DCMAKE_BUILD_TYPE=${PAIMON_CPP_BUILD_TYPE}
     -DCMAKE_INSTALL_PREFIX=${PAIMON_CPP_PREFIX}
     -DCMAKE_INSTALL_LIBDIR=lib64
     -DLIBUNWIND_LIBRARY=FALSE
     -DPAIMON_DEPENDENCY_SOURCE=BUNDLED
     -DPAIMON_BUILD_TESTS=OFF
-    -DPAIMON_BUILD_SHARED=ON
-    -DPAIMON_BUILD_STATIC=OFF
-    -DPAIMON_ENABLE_JINDO=ON
+    -DPAIMON_BUILD_SHARED=${PAIMON_CPP_BUILD_SHARED}
+    -DPAIMON_BUILD_STATIC=${PAIMON_CPP_BUILD_STATIC}
+    -DPAIMON_ENABLE_JINDO=${PAIMON_CPP_ENABLE_JINDO}
     -DPAIMON_ENABLE_S3=ON
     -DPAIMON_ENABLE_REST=ON
     -DPAIMON_ENABLE_ORC=ON
     -DPAIMON_ENABLE_AVRO=ON
     -DPAIMON_ENABLE_LUMINA=OFF
     -DPAIMON_ENABLE_LUCENE=OFF
+    ${PAIMON_CPP_SELF_CONTAINED_CMAKE_ARGS}
     ${PAIMON_CPP_TOOLCHAIN_ARGS}
   BUILD_BYPRODUCTS
-    ${PAIMON_CPP_LIB}/libpaimon${CMAKE_SHARED_LIBRARY_SUFFIX}
-    ${PAIMON_CPP_LIB}/libpaimon_file_index${CMAKE_SHARED_LIBRARY_SUFFIX}
-    ${PAIMON_CPP_LIB}/libpaimon_global_index${CMAKE_SHARED_LIBRARY_SUFFIX}
-    ${PAIMON_CPP_LIB}/libpaimon_local_file_system${CMAKE_SHARED_LIBRARY_SUFFIX}
-    ${PAIMON_CPP_LIB}/libpaimon_jindo_file_system${CMAKE_SHARED_LIBRARY_SUFFIX}
-    ${PAIMON_CPP_LIB}/libpaimon_s3_file_system${CMAKE_SHARED_LIBRARY_SUFFIX}
-    ${PAIMON_CPP_LIB}/${JINDOSDK_C_INSTALLED_NAME}
-    ${PAIMON_CPP_LIB}/libpaimon_parquet_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
-    ${PAIMON_CPP_LIB}/libpaimon_orc_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
-    ${PAIMON_CPP_LIB}/libpaimon_avro_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
-    ${PAIMON_CPP_LIB}/libpaimon_blob_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_BUILD_BYPRODUCTS}
 )
 
 # On macOS, paimon-cpp installs the JindoSDK dylib with a versioned filename
 # (e.g. libjindosdk_c.6.10.2.dylib) but its install_name uses the short
 # version (libjindosdk_c.6.dylib). Add a post-install step to provide the
 # short-named copy that runtime lookup expects.
-if(APPLE)
+if(APPLE AND NOT PAIMON_VANE_SELF_CONTAINED)
   ExternalProject_Add_Step(paimon_cpp_ep jindosdk_short_name
     DEPENDEES install
     BYPRODUCTS ${PAIMON_CPP_LIB}/${JINDOSDK_C_RUNTIME_NAME}
@@ -154,7 +247,55 @@ if(PAIMON_VANE_DISTRIBUTED)
 endif()
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
-build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+if(PAIMON_VANE_SELF_CONTAINED)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_library(paimon_vane_bundle_objects OBJECT ${EXTENSION_SOURCES})
+  target_compile_definitions(paimon_vane_bundle_objects
+                             PRIVATE DUCKDB_BUILD_LOADABLE_EXTENSION)
+  target_include_directories(paimon_vane_bundle_objects SYSTEM
+                             PRIVATE ${PAIMON_CPP_INCLUDE})
+  set_target_properties(paimon_vane_bundle_objects
+                        PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  add_dependencies(paimon_vane_bundle_objects paimon_cpp_ep)
+
+  set(PAIMON_VANE_ISOLATED_BUNDLE
+      ${CMAKE_CURRENT_BINARY_DIR}/vane-paimon-isolated-bundle.o)
+  add_custom_command(
+    OUTPUT ${PAIMON_VANE_ISOLATED_BUNDLE}
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/scripts/isolate_vane_static_bundle.py
+      --linker ${CMAKE_LINKER}
+      --archiver ${CMAKE_AR}
+      --objcopy ${CMAKE_OBJCOPY}
+      --nm ${CMAKE_NM}
+      --output ${PAIMON_VANE_ISOLATED_BUNDLE}
+      --entry-symbol paimon_duckdb_cpp_init
+      --objects $<TARGET_OBJECTS:paimon_vane_bundle_objects>
+      --component-archives ${PAIMON_CPP_STATIC_COMPONENT_LIBS}
+      --dependency-archives ${PAIMON_CPP_STATIC_DEPENDENCY_LIBS}
+                            ${PAIMON_CPP_VCPKG_STATIC_LIBS}
+    DEPENDS
+      paimon_cpp_ep
+      paimon_vane_bundle_objects
+      ${PAIMON_CPP_STATIC_COMPONENT_LIBS}
+      ${PAIMON_CPP_STATIC_DEPENDENCY_LIBS}
+      ${PAIMON_CPP_VCPKG_STATIC_LIBS}
+      ${CMAKE_CURRENT_SOURCE_DIR}/scripts/isolate_vane_static_bundle.py
+    COMMAND_EXPAND_LISTS
+    VERBATIM)
+  add_custom_target(paimon_vane_isolated_bundle
+                    DEPENDS ${PAIMON_VANE_ISOLATED_BUNDLE})
+  set_source_files_properties(${PAIMON_VANE_ISOLATED_BUNDLE}
+                              PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+  build_loadable_extension(${TARGET_NAME} " " ${PAIMON_VANE_ISOLATED_BUNDLE})
+  set_target_properties(${TARGET_NAME}_loadable_extension
+                        PROPERTIES LINKER_LANGUAGE CXX)
+  add_dependencies(${TARGET_NAME}_loadable_extension
+                   paimon_vane_isolated_bundle)
+else()
+  build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+endif()
 
 # Include paimon-cpp and arrow headers
 target_include_directories(${EXTENSION_NAME} SYSTEM PRIVATE ${PAIMON_CPP_INCLUDE})
@@ -164,25 +305,48 @@ target_include_directories(${TARGET_NAME}_loadable_extension SYSTEM PRIVATE ${PA
 add_dependencies(${EXTENSION_NAME} paimon_cpp_ep)
 add_dependencies(${TARGET_NAME}_loadable_extension paimon_cpp_ep)
 
-# Link with paimon-cpp
-set(PAIMON_CPP_LIBS
-  ${PAIMON_CPP_LIB}/libpaimon${CMAKE_SHARED_LIBRARY_SUFFIX}
-  $<$<NOT:$<PLATFORM_ID:Darwin>>:-Wl,--no-as-needed>
-  ${PAIMON_CPP_LIB}/libpaimon_file_index${CMAKE_SHARED_LIBRARY_SUFFIX}
-  ${PAIMON_CPP_LIB}/libpaimon_global_index${CMAKE_SHARED_LIBRARY_SUFFIX}
-  ${PAIMON_CPP_LIB}/libpaimon_local_file_system${CMAKE_SHARED_LIBRARY_SUFFIX}
-  ${PAIMON_CPP_LIB}/libpaimon_jindo_file_system${CMAKE_SHARED_LIBRARY_SUFFIX}
-  ${PAIMON_CPP_LIB}/libpaimon_s3_file_system${CMAKE_SHARED_LIBRARY_SUFFIX}
-  ${PAIMON_CPP_LIB}/${JINDOSDK_C_INSTALLED_NAME}
-  ${PAIMON_CPP_LIB}/libpaimon_parquet_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
-  ${PAIMON_CPP_LIB}/libpaimon_orc_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
-  ${PAIMON_CPP_LIB}/libpaimon_avro_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
-  ${PAIMON_CPP_LIB}/libpaimon_blob_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
-  ${PAIMON_CPP_VCPKG_LIBS}
-  $<$<NOT:$<PLATFORM_ID:Darwin>>:-Wl,--as-needed>
-)
-target_link_libraries(${EXTENSION_NAME} ${PAIMON_CPP_LIBS})
-target_link_libraries(${TARGET_NAME}_loadable_extension ${PAIMON_CPP_LIBS})
+# Link with paimon-cpp. The provider build retains every registration object
+# from the component archives, then resolves the complete bundled dependency
+# closure inside one loadable extension. The ordinary native build keeps its
+# existing shared-library layout.
+if(PAIMON_VANE_SELF_CONTAINED)
+  find_package(Threads REQUIRED)
+  target_link_libraries(
+    ${TARGET_NAME}_loadable_extension
+    Threads::Threads
+    ${CMAKE_DL_LIBS})
+  set(PAIMON_VANE_VERSION_SCRIPT
+      ${CMAKE_CURRENT_BINARY_DIR}/vane-paimon-exports.map)
+  file(WRITE ${PAIMON_VANE_VERSION_SCRIPT}
+       "{\n  global: paimon_duckdb_cpp_init;\n  local: *;\n};\n")
+  target_link_options(
+    ${TARGET_NAME}_loadable_extension
+    PRIVATE
+      -Wl,--version-script=${PAIMON_VANE_VERSION_SCRIPT}
+      -Wl,--exclude-libs,ALL
+      -Wl,-Bsymbolic
+      -Wl,--gc-sections
+      -Wl,--strip-all
+      -Wl,-z,defs)
+else()
+  set(PAIMON_CPP_LIBS
+    ${PAIMON_CPP_LIB}/libpaimon${CMAKE_SHARED_LIBRARY_SUFFIX}
+    $<$<NOT:$<PLATFORM_ID:Darwin>>:-Wl,--no-as-needed>
+    ${PAIMON_CPP_LIB}/libpaimon_file_index${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/libpaimon_global_index${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/libpaimon_local_file_system${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/libpaimon_jindo_file_system${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/libpaimon_s3_file_system${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/${JINDOSDK_C_INSTALLED_NAME}
+    ${PAIMON_CPP_LIB}/libpaimon_parquet_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/libpaimon_orc_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/libpaimon_avro_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_LIB}/libpaimon_blob_file_format${CMAKE_SHARED_LIBRARY_SUFFIX}
+    ${PAIMON_CPP_VCPKG_LIBS}
+    $<$<NOT:$<PLATFORM_ID:Darwin>>:-Wl,--as-needed>)
+  target_link_libraries(${EXTENSION_NAME} ${PAIMON_CPP_LIBS})
+  target_link_libraries(${TARGET_NAME}_loadable_extension ${PAIMON_CPP_LIBS})
+endif()
 
 if(APPLE)
   # Propagate rpath so unittest/shell can find paimon-cpp shared libraries.
@@ -211,8 +375,8 @@ set(PAIMON_CPP_RUNTIME_BUNDLE_LIBS
 # Paimon runtime DSOs beside that module and resolve them relative to the wheel
 # instead of retaining a build-tree RUNPATH. Native DuckDB packaging continues
 # to use the existing loadable-extension bundle below.
-if(PAIMON_VANE_DISTRIBUTED AND DEFINED SKBUILD_PLATLIB_DIR AND UNIX AND
-   NOT APPLE)
+if(PAIMON_VANE_DISTRIBUTED AND NOT PAIMON_VANE_SELF_CONTAINED AND
+   DEFINED SKBUILD_PLATLIB_DIR AND UNIX AND NOT APPLE)
   set(PAIMON_VANE_WHEEL_RUNTIME_LIBS
     ${PAIMON_CPP_LIB}/libpaimon${CMAKE_SHARED_LIBRARY_SUFFIX}
     ${PAIMON_CPP_LIB}/libpaimon_file_index${CMAKE_SHARED_LIBRARY_SUFFIX}
@@ -261,21 +425,22 @@ if(PAIMON_VANE_DISTRIBUTED AND DEFINED SKBUILD_PLATLIB_DIR AND UNIX AND
                  DESTINATION vane/licenses/paimon-cpp/jindosdk-nextarch)
 endif()
 
-foreach(lib IN LISTS PAIMON_CPP_RUNTIME_BUNDLE_LIBS)
-  add_custom_command(
-    TARGET ${TARGET_NAME}_loadable_extension
-    POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      ${lib}
-      $<TARGET_FILE_DIR:${TARGET_NAME}_loadable_extension>
-  )
-endforeach()
-set_target_properties(${TARGET_NAME}_loadable_extension PROPERTIES
-  BUILD_RPATH "${PAIMON_RPATH}"
-  INSTALL_RPATH "${PAIMON_RPATH}"
-  BUILD_WITH_INSTALL_RPATH ON
-  INSTALL_RPATH_USE_LINK_PATH OFF
-)
+if(NOT PAIMON_VANE_SELF_CONTAINED)
+  foreach(lib IN LISTS PAIMON_CPP_RUNTIME_BUNDLE_LIBS)
+    add_custom_command(
+      TARGET ${TARGET_NAME}_loadable_extension
+      POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${lib}
+        $<TARGET_FILE_DIR:${TARGET_NAME}_loadable_extension>
+    )
+  endforeach()
+  set_target_properties(${TARGET_NAME}_loadable_extension PROPERTIES
+    BUILD_RPATH "${PAIMON_RPATH}"
+    INSTALL_RPATH "${PAIMON_RPATH}"
+    BUILD_WITH_INSTALL_RPATH ON
+    INSTALL_RPATH_USE_LINK_PATH OFF)
+endif()
 
 install(
   TARGETS ${EXTENSION_NAME}
