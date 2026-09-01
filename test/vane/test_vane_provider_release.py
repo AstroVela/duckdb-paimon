@@ -44,9 +44,7 @@ def load_script(name: str, relative_path: str) -> ModuleType:
     return module
 
 
-def require_error(
-    error_type: type[BaseException], operation: Callable[[], object]
-) -> BaseException:
+def require_error(error_type: type[BaseException], operation: Callable[[], object]) -> BaseException:
     try:
         operation()
     except error_type as error:
@@ -90,9 +88,7 @@ def exercise_release_validator(validator: ModuleType) -> None:
         wheels = write_release(directory)
         actual_version = validator.validate_release(directory, VANE_VERSION)
         if actual_version != PAIMON_VERSION:
-            raise AssertionError(
-                f"expected Paimon version {PAIMON_VERSION}, got {actual_version}"
-            )
+            raise AssertionError(f"expected Paimon version {PAIMON_VERSION}, got {actual_version}")
 
         expected_hashes = {wheel.name: sha256(wheel) for wheel in wheels}
         original_request = validator._request_json
@@ -156,9 +152,7 @@ def exercise_release_validator(validator: ModuleType) -> None:
     with tempfile.TemporaryDirectory(prefix="vane-paimon-release-dependency-") as value:
         directory = Path(value)
         write_release(directory)
-        invalid = directory / (
-            f"vane_extension_paimon-{PAIMON_VERSION}-cp314-none-{PLATFORM}.whl"
-        )
+        invalid = directory / (f"vane_extension_paimon-{PAIMON_VERSION}-cp314-none-{PLATFORM}.whl")
         invalid.unlink()
         write_wheel(directory, "cp314", requirement="vane-ai>=0.2")
         require_error(
@@ -187,9 +181,7 @@ def exercise_private_key_consumption(builder: ModuleType) -> None:
             lambda: builder._read_signing_private_key(public_mode, consume=True),
         )
         if not public_mode.exists():
-            raise AssertionError(
-                "an invalid private-key input was unexpectedly consumed"
-            )
+            raise AssertionError("an invalid private-key input was unexpectedly consumed")
 
         target = directory / "target.pem"
         target.write_bytes(b"candidate-private-key")
@@ -201,9 +193,7 @@ def exercise_private_key_consumption(builder: ModuleType) -> None:
             lambda: builder._read_signing_private_key(symbolic, consume=True),
         )
         if not target.exists():
-            raise AssertionError(
-                "a symbolic private-key target was unexpectedly consumed"
-            )
+            raise AssertionError("a symbolic private-key target was unexpectedly consumed")
 
 
 def main() -> None:
