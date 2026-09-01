@@ -39,7 +39,7 @@ EXTENSION_NAME = "paimon"
 SIGNING_PROFILES = {
     "ci-test": ("vane-ci-test-key", "VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY"),
     "testpypi": (
-        "astrovela/vane-testpypi-v1",
+        "astrovela/vane-testpypi",
         "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY",
     ),
 }
