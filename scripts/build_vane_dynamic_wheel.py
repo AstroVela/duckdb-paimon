@@ -113,7 +113,7 @@ ALLOWED_RUNTIME_LIBRARIES = frozenset(
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 PROVIDER_PLATFORM_TAG = "manylinux_2_28_x86_64"
 _AUDITWHEEL_PLATFORM_RE = re.compile(
-    r'is consistent with the following platform tag:\s*"([^"]+)"'
+    r'is\s+consistent\s+with\s+the\s+following\s+platform\s+tag:\s*"([^"]+)"'
 )
 _MANYLINUX_PLATFORM_RE = re.compile(r"^manylinux_([0-9]+)_([0-9]+)_x86_64$")
 
@@ -217,7 +217,11 @@ def _require_wheel_platform(wheel: Path, expected: str) -> None:
         if (match := _MANYLINUX_PLATFORM_RE.fullmatch(candidate)) is not None
     ]
     expected_version = (int(expected_match.group(1)), int(expected_match.group(2)))
-    if len(reported) != 1 or not reported_versions or max(reported_versions) > expected_version:
+    if (
+        len(reported) != 1
+        or not reported_versions
+        or max(reported_versions) > expected_version
+    ):
         raise QualificationError(
             f"{wheel.name} has auditwheel platform {reported!r}, which is not "
             f"compatible with the required ceiling {expected!r}"
@@ -312,9 +316,7 @@ def _build_environment(
         f'list(PREPEND CMAKE_PREFIX_PATH "{dependency_prefix}")\n',
         encoding="utf-8",
     )
-    extension_config = _write_loadable_extension_config(
-        extension_root, build_directory
-    )
+    extension_config = _write_loadable_extension_config(extension_root, build_directory)
     cmake_arguments = [
         "--fresh",
         "-DBUILD_DISTRIBUTED_EXCHANGE=ON",
@@ -740,8 +742,7 @@ def main() -> int:
         )
 
         unsigned = _require_file(
-            build_directory
-            / "duckdb/extension/paimon/paimon.duckdb_extension",
+            build_directory / "duckdb/extension/paimon/paimon.duckdb_extension",
             "unsigned Paimon artifact",
         )
         _require_self_contained_artifact(unsigned)
