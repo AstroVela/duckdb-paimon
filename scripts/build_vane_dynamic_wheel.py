@@ -24,6 +24,7 @@ import platform
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -35,7 +36,13 @@ import tomllib
 from packaging.tags import sys_tags
 
 EXTENSION_NAME = "paimon"
-TRUST_IDENTITY = "vane-ci-test-key"
+SIGNING_PROFILES = {
+    "ci-test": ("vane-ci-test-key", "VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY"),
+    "testpypi": (
+        "astrovela/vane-testpypi-v1",
+        "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY",
+    ),
+}
 LICENSE_EXPRESSION = (
     "0BSD AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND "
     "ISC AND MIT AND NCSA AND Unicode-DFS-2015 AND Zlib AND curl"
@@ -116,6 +123,7 @@ _AUDITWHEEL_PLATFORM_RE = re.compile(
     r'is\s+consistent\s+with\s+the\s+following\s+platform\s+tag:\s*"([^"]+)"'
 )
 _MANYLINUX_PLATFORM_RE = re.compile(r"^manylinux_([0-9]+)_([0-9]+)_x86_64$")
+_MAX_SIGNING_PRIVATE_KEY_BYTES = 64 * 1024
 
 
 class QualificationError(RuntimeError):
@@ -155,6 +163,40 @@ def _require_file(path: Path, description: str) -> Path:
     if not resolved.is_file():
         raise QualificationError(f"{description} is not a file: {resolved}")
     return resolved
+
+
+def _destroy_file(path: Path) -> None:
+    size = path.stat().st_size
+    with path.open("r+b", buffering=0) as destination:
+        destination.write(b"\0" * size)
+        os.fsync(destination.fileno())
+    path.unlink()
+
+
+def _read_signing_private_key(path: Path, *, consume: bool) -> bytearray:
+    unresolved = path.expanduser().absolute()
+    if consume and unresolved.is_symlink():
+        raise QualificationError(
+            "consumed extension signing private key must not be a symbolic link"
+        )
+    resolved = _require_file(path, "extension signing private key")
+    metadata = resolved.stat()
+    size = metadata.st_size
+    if size <= 0 or size > _MAX_SIGNING_PRIVATE_KEY_BYTES:
+        raise QualificationError("extension signing private key has an invalid size")
+    if consume and (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise QualificationError(
+            "consumed extension signing private key must be a private, owned regular file"
+        )
+    contents = bytearray(resolved.read_bytes())
+    if consume:
+        _destroy_file(resolved)
+    return contents
 
 
 def _require_git_revision(source: Path, expected: str, description: str) -> None:
@@ -299,6 +341,7 @@ def _build_environment(
     vane_vcpkg_installed: Path,
     vcpkg_toolchain: Path,
     jobs: int,
+    signing_cmake_option: str,
 ) -> dict[str, str]:
     target_triplet = "x64-linux"
     dependency_prefix = vane_vcpkg_installed / target_triplet
@@ -325,7 +368,7 @@ def _build_environment(
         "-DEXTENSION_STATIC_BUILD=ON",
         "-DPAIMON_VANE_DISTRIBUTED=ON",
         "-DPAIMON_VANE_SELF_CONTAINED=ON",
-        "-DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON",
+        f"-D{signing_cmake_option}=ON",
         f"-DDUCKDB_EXTENSION_CONFIGS={extension_config}",
         "-DVCPKG_BUILD=ON",
         f"-DCMAKE_TOOLCHAIN_FILE={vcpkg_toolchain}",
@@ -602,13 +645,13 @@ def _stage_license_files(
 
 
 def _builder_python(
-    base_wheel: Path, parent: Path
+    interpreter: Path, base_wheel: Path, parent: Path
 ) -> tuple[tempfile.TemporaryDirectory[str], Path]:
     temporary = tempfile.TemporaryDirectory(
         prefix="vane-paimon-wheel-builder-", dir=parent
     )
     environment_root = Path(temporary.name)
-    _run((sys.executable, "-I", "-m", "venv", "--copies", str(environment_root)))
+    _run((str(interpreter), "-I", "-m", "venv", "--copies", str(environment_root)))
     python = environment_root / "bin/python"
     _run(
         (
@@ -618,6 +661,7 @@ def _builder_python(
             "install",
             "--disable-pip-version-check",
             "packaging>=24.2",
+            "tomli>=1.1; python_version < '3.11'",
             str(base_wheel),
         )
     )
@@ -631,6 +675,7 @@ def _build_provider_wheel(
     artifact: Path,
     output_directory: Path,
     platform_tag: str,
+    trust_identity: str,
     license_files: Iterable[Path],
 ) -> Path:
     command = [
@@ -646,7 +691,7 @@ def _build_provider_wheel(
         "--platform-tag",
         platform_tag,
         "--trust-identity",
-        TRUST_IDENTITY,
+        trust_identity,
         "--license-expression",
         LICENSE_EXPRESSION,
     ]
@@ -670,6 +715,35 @@ def _parse_arguments() -> argparse.Namespace:
     parser.add_argument("--build-directory", required=True, type=Path)
     parser.add_argument("--output-directory", required=True, type=Path)
     parser.add_argument("--jobs", default=8, type=int)
+    parser.add_argument(
+        "--signing-profile", required=True, choices=tuple(SIGNING_PROFILES)
+    )
+    parser.add_argument("--signing-private-key", required=True, type=Path)
+    parser.add_argument(
+        "--consume-signing-private-key",
+        action="store_true",
+        help="Securely remove the ephemeral key input before any build subprocess",
+    )
+    runtime_group = parser.add_mutually_exclusive_group(required=True)
+    runtime_group.add_argument(
+        "--package-local-runtime",
+        action="store_true",
+        help="Package and emit the locally built Vane wheel for CI qualification",
+    )
+    runtime_group.add_argument(
+        "--runtime-python",
+        action="append",
+        default=[],
+        type=Path,
+        help="Interpreter matching one indexed runtime wheel; repeat with --runtime-wheel",
+    )
+    parser.add_argument(
+        "--runtime-wheel",
+        action="append",
+        default=[],
+        type=Path,
+        help="Exact indexed Vane wheel matching one --runtime-python",
+    )
     return parser.parse_args()
 
 
@@ -677,12 +751,44 @@ def main() -> int:
     arguments = _parse_arguments()
     if arguments.jobs <= 0:
         raise QualificationError("--jobs must be a positive integer")
+    if arguments.package_local_runtime and arguments.runtime_wheel:
+        raise QualificationError(
+            "--runtime-wheel cannot be combined with --package-local-runtime"
+        )
+    if len(arguments.runtime_python) != len(arguments.runtime_wheel):
+        raise QualificationError(
+            "--runtime-python and --runtime-wheel must be supplied the same number of times"
+        )
+    if not arguments.package_local_runtime and not arguments.runtime_python:
+        raise QualificationError("at least one indexed runtime pair is required")
 
     extension_root = _require_directory(arguments.extension_root, "extension root")
     vane_source = _require_directory(arguments.vane_source, "Vane source")
     vane_vcpkg_installed = _require_directory(
         arguments.vane_vcpkg_installed, "Vane vcpkg installation"
     )
+    trust_identity, signing_cmake_option = SIGNING_PROFILES[arguments.signing_profile]
+    if (
+        arguments.signing_profile == "testpypi"
+        and not arguments.consume_signing_private_key
+    ):
+        raise QualificationError(
+            "the TestPyPI signing profile requires --consume-signing-private-key"
+        )
+    indexed_runtimes: tuple[tuple[Path, Path], ...] = tuple(
+        (
+            _require_file(interpreter, "runtime Python interpreter"),
+            _require_file(wheel, "indexed Vane runtime wheel"),
+        )
+        for interpreter, wheel in zip(
+            arguments.runtime_python, arguments.runtime_wheel, strict=True
+        )
+    )
+    for interpreter, _wheel in indexed_runtimes:
+        if not os.access(interpreter, os.X_OK):
+            raise QualificationError(
+                f"runtime Python interpreter is not executable: {interpreter}"
+            )
     vcpkg_toolchain = _require_vcpkg_toolchain(
         arguments.vcpkg_toolchain,
         _vcpkg_baseline(extension_root),
@@ -705,127 +811,181 @@ def main() -> int:
         vane_vcpkg_installed=vane_vcpkg_installed,
         vcpkg_toolchain=vcpkg_toolchain,
         jobs=arguments.jobs,
+        signing_cmake_option=signing_cmake_option,
+    )
+    signing_private_key_contents = _read_signing_private_key(
+        arguments.signing_private_key,
+        consume=arguments.consume_signing_private_key,
     )
 
-    with tempfile.TemporaryDirectory(
-        prefix="vane-base-wheel-", dir=build_directory.parent
-    ) as base_output_value:
-        base_output = Path(base_output_value)
-        _run(
-            (
-                sys.executable,
-                "-m",
-                "build",
-                "--wheel",
-                "--no-isolation",
-                "--outdir",
-                str(base_output),
-                str(vane_source),
-            ),
-            cwd=extension_root,
-            environment=environment,
-        )
-        base_wheel = _one_wheel(base_output, "vane_ai-*.whl", "base Vane wheel")
-        _require_base_wheel_free_of_paimon(base_wheel)
-        _run(
-            (
-                "cmake",
-                "--build",
-                str(build_directory),
-                "--target",
-                "paimon_loadable_extension",
-                "--parallel",
-                str(arguments.jobs),
-            ),
-            cwd=extension_root,
-            environment=environment,
-        )
-
-        unsigned = _require_file(
-            build_directory / "duckdb/extension/paimon/paimon.duckdb_extension",
-            "unsigned Paimon artifact",
-        )
-        _require_self_contained_artifact(unsigned)
-        signed_directory = build_directory / "signed-vane-extensions"
-        signed_directory.mkdir(parents=True, exist_ok=True)
-        signed = signed_directory / unsigned.name
-        _run(
-            (
-                sys.executable,
-                str(vane_source / "scripts/sign_test_dynamic_extension.py"),
-                "--private-key",
-                str(vane_source / "external/duckdb/test/mbedtls/private.pem"),
-                str(unsigned),
-                str(signed),
-            )
-        )
-
-        licenses = _stage_license_files(
-            extension_root=extension_root,
-            vane_source=vane_source,
-            build_directory=build_directory,
-        )
+    try:
         with tempfile.TemporaryDirectory(
-            prefix="vane-qualified-wheels-", dir=output_directory.parent
-        ) as staging_value:
-            staging = Path(staging_value)
-            repaired_base_directory = staging / "base"
-            provider_directory = staging / "extension"
-            repaired_base_directory.mkdir()
-            provider_directory.mkdir()
+            prefix="vane-base-wheel-", dir=build_directory.parent
+        ) as base_output_value:
+            base_output = Path(base_output_value)
             _run(
                 (
                     sys.executable,
                     "-m",
-                    "auditwheel",
-                    "repair",
-                    "--plat",
-                    platform_tag,
-                    "--wheel-dir",
-                    str(repaired_base_directory),
-                    str(base_wheel),
-                )
+                    "build",
+                    "--wheel",
+                    "--no-isolation",
+                    "--outdir",
+                    str(base_output),
+                    str(vane_source),
+                ),
+                cwd=extension_root,
+                environment=environment,
             )
-            repaired_base = _one_wheel(
-                repaired_base_directory, "vane_ai-*.whl", "repaired base Vane wheel"
+            base_wheel = _one_wheel(base_output, "vane_ai-*.whl", "base Vane wheel")
+            _require_base_wheel_free_of_paimon(base_wheel)
+            _run(
+                (
+                    "cmake",
+                    "--build",
+                    str(build_directory),
+                    "--target",
+                    "paimon_loadable_extension",
+                    "--parallel",
+                    str(arguments.jobs),
+                ),
+                cwd=extension_root,
+                environment=environment,
             )
-            _require_wheel_platform(repaired_base, platform_tag)
 
-            builder_environment, builder_python = _builder_python(
-                base_wheel, build_directory.parent
+            unsigned = _require_file(
+                build_directory / "duckdb/extension/paimon/paimon.duckdb_extension",
+                "unsigned Paimon artifact",
             )
+            _require_self_contained_artifact(unsigned)
+            signed_directory = build_directory / "signed-vane-extensions"
+            signed_directory.mkdir(parents=True, exist_ok=True)
+            signed = signed_directory / unsigned.name
+            key_handle, ephemeral_key_name = tempfile.mkstemp(
+                prefix=".vane-extension-signing-",
+                suffix=".pem",
+                dir=signed_directory,
+            )
+            ephemeral_key = Path(ephemeral_key_name)
             try:
-                provider_wheel = _build_provider_wheel(
-                    python=builder_python,
-                    vane_source=vane_source,
-                    artifact=signed,
-                    output_directory=provider_directory,
-                    platform_tag=platform_tag,
-                    license_files=licenses,
-                )
-                _require_wheel_platform(provider_wheel, platform_tag)
+                with os.fdopen(key_handle, "wb") as key_output:
+                    os.fchmod(key_output.fileno(), 0o600)
+                    key_output.write(signing_private_key_contents)
+                    key_output.flush()
+                    os.fsync(key_output.fileno())
                 _run(
                     (
-                        str(builder_python),
-                        "-I",
-                        str(vane_source / "scripts/verify_extension_wheel.py"),
-                        "--base-wheel",
-                        str(repaired_base),
-                        "--extension-wheel",
-                        str(provider_wheel),
-                        "--extension-name",
-                        EXTENSION_NAME,
-                        "--trust-identity",
-                        TRUST_IDENTITY,
+                        sys.executable,
+                        str(vane_source / "scripts/sign_test_dynamic_extension.py"),
+                        "--private-key",
+                        str(ephemeral_key),
+                        str(unsigned),
+                        str(signed),
                     )
                 )
             finally:
-                builder_environment.cleanup()
+                signing_private_key_contents[:] = b"\0" * len(
+                    signing_private_key_contents
+                )
+                signing_private_key_contents.clear()
+                if ephemeral_key.exists():
+                    _destroy_file(ephemeral_key)
 
-            for wheel in (repaired_base, provider_wheel):
-                destination = output_directory / wheel.name
-                shutil.copyfile(wheel, destination)
-                print(destination)
+            licenses = _stage_license_files(
+                extension_root=extension_root,
+                vane_source=vane_source,
+                build_directory=build_directory,
+            )
+            with tempfile.TemporaryDirectory(
+                prefix="vane-qualified-wheels-", dir=output_directory.parent
+            ) as staging_value:
+                staging = Path(staging_value)
+                emitted_base_wheel: Path | None = None
+                if arguments.package_local_runtime:
+                    repaired_base_directory = staging / "base"
+                    repaired_base_directory.mkdir()
+                    _run(
+                        (
+                            sys.executable,
+                            "-m",
+                            "auditwheel",
+                            "repair",
+                            "--plat",
+                            platform_tag,
+                            "--wheel-dir",
+                            str(repaired_base_directory),
+                            str(base_wheel),
+                        )
+                    )
+                    emitted_base_wheel = _one_wheel(
+                        repaired_base_directory,
+                        "vane_ai-*.whl",
+                        "repaired base Vane wheel",
+                    )
+                    _require_wheel_platform(emitted_base_wheel, platform_tag)
+                    runtimes = ((Path(sys.executable).resolve(), emitted_base_wheel),)
+                else:
+                    runtimes = indexed_runtimes
+
+                built_provider_wheels: list[Path] = []
+                for runtime_index, (runtime_python, runtime_wheel) in enumerate(
+                    runtimes
+                ):
+                    _require_base_wheel_free_of_paimon(runtime_wheel)
+                    _require_wheel_platform(runtime_wheel, platform_tag)
+                    provider_directory = staging / f"extension-{runtime_index}"
+                    provider_directory.mkdir()
+                    builder_environment, builder_python = _builder_python(
+                        runtime_python,
+                        runtime_wheel,
+                        build_directory.parent,
+                    )
+                    try:
+                        provider_wheel = _build_provider_wheel(
+                            python=builder_python,
+                            vane_source=vane_source,
+                            artifact=signed,
+                            output_directory=provider_directory,
+                            platform_tag=platform_tag,
+                            trust_identity=trust_identity,
+                            license_files=licenses,
+                        )
+                        _require_wheel_platform(provider_wheel, platform_tag)
+                        _run(
+                            (
+                                str(builder_python),
+                                "-I",
+                                str(vane_source / "scripts/verify_extension_wheel.py"),
+                                "--base-wheel",
+                                str(runtime_wheel),
+                                "--extension-wheel",
+                                str(provider_wheel),
+                                "--extension-name",
+                                EXTENSION_NAME,
+                                "--trust-identity",
+                                trust_identity,
+                            )
+                        )
+                    finally:
+                        builder_environment.cleanup()
+                    built_provider_wheels.append(provider_wheel)
+
+                wheels_to_emit = (
+                    *((emitted_base_wheel,) if emitted_base_wheel else ()),
+                    *built_provider_wheels,
+                )
+                for wheel in wheels_to_emit:
+                    destination = output_directory / wheel.name
+                    if destination.exists():
+                        raise QualificationError(
+                            "multiple runtime targets produced the same wheel: "
+                            f"{destination.name}"
+                        )
+                    shutil.copyfile(wheel, destination)
+                    print(destination)
+    finally:
+        signing_private_key_contents[:] = b"\0" * len(signing_private_key_contents)
+        signing_private_key_contents.clear()
     return 0
 
 
