@@ -227,18 +227,27 @@ def _expected_wheel_hashes(
 ) -> dict[str, str]:
     normalized_name = canonicalize_name(distribution_name)
     canonical_version = _canonical_version(version, "provider version")
-    expected = {
-        path.name: _sha256(path)
-        for path in sorted(directory.expanduser().resolve().glob("*.whl"))
-        if parse_wheel_filename(path.name)[0] == normalized_name
-        and str(parse_wheel_filename(path.name)[1]) == canonical_version
-    }
-    if len(expected) != 5:
+    paths: list[Path] = []
+    for path in sorted(directory.expanduser().resolve().glob("*.whl")):
+        filename_name, filename_version, _build, _tags = parse_wheel_filename(path.name)
+        if (
+            filename_name == normalized_name
+            and str(filename_version) == canonical_version
+        ):
+            paths.append(path)
+
+    records = tuple(_read_wheel(path) for path in paths)
+    if len(records) != 5:
         raise ReleaseValidationError(
             f"expected five local {distribution_name}=={canonical_version} wheels, "
-            f"found {len(expected)}"
+            f"found {len(records)}"
         )
-    return expected
+    if {record.interpreter for record in records} != EXPECTED_INTERPRETERS:
+        raise ReleaseValidationError(
+            f"{distribution_name}=={canonical_version} must contain exactly one "
+            "wheel for each CPython 3.10 through 3.14"
+        )
+    return {record.path.name: _sha256(record.path) for record in records}
 
 
 def _indexed_wheel_hashes(

@@ -57,13 +57,14 @@ def write_wheel(
     interpreter: str,
     *,
     requirement: str = f"vane-ai==={VANE_VERSION}",
+    metadata_name: str = "vane-extension-paimon",
 ) -> Path:
     distribution = "vane_extension_paimon"
     filename = f"{distribution}-{PAIMON_VERSION}-{interpreter}-none-{PLATFORM}.whl"
     metadata_directory = f"{distribution}-{PAIMON_VERSION}.dist-info"
     metadata = (
         "Metadata-Version: 2.4\n"
-        "Name: vane-extension-paimon\n"
+        f"Name: {metadata_name}\n"
         f"Version: {PAIMON_VERSION}\n"
         f"Requires-Dist: {requirement}\n"
         "\n"
@@ -159,6 +160,51 @@ def exercise_release_validator(validator: ModuleType) -> None:
             validator.ReleaseValidationError,
             lambda: validator.validate_release(directory, VANE_VERSION),
         )
+
+    with tempfile.TemporaryDirectory(prefix="vane-paimon-release-index-tags-") as value:
+        directory = Path(value)
+        wheels = write_release(directory)
+        wheels[-1].unlink()
+        write_wheel(directory, "cp39")
+        original_request = validator._request_json
+        try:
+            validator._request_json = lambda _url: (404, None)
+            require_error(
+                validator.ReleaseValidationError,
+                lambda: validator.require_index_publishable(directory, PAIMON_VERSION),
+            )
+        finally:
+            validator._request_json = original_request
+
+    with tempfile.TemporaryDirectory(prefix="vane-paimon-release-index-metadata-") as value:
+        directory = Path(value)
+        wheels = write_release(directory)
+        wheels[-1].unlink()
+        write_wheel(directory, "cp314", metadata_name="vane-extension-not-paimon")
+        indexed_complete = {
+            "urls": [
+                {
+                    "digests": {"sha256": sha256(wheel)},
+                    "filename": wheel.name,
+                    "packagetype": "bdist_wheel",
+                }
+                for wheel in sorted(directory.glob("*.whl"))
+            ]
+        }
+        original_request = validator._request_json
+        try:
+            validator._request_json = lambda _url: (200, indexed_complete)
+            require_error(
+                validator.ReleaseValidationError,
+                lambda: validator.require_index_match(
+                    directory,
+                    PAIMON_VERSION,
+                    attempts=1,
+                    delay_seconds=0,
+                ),
+            )
+        finally:
+            validator._request_json = original_request
 
 
 def exercise_private_key_consumption(builder: ModuleType) -> None:
