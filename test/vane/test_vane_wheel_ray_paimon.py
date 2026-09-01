@@ -13,18 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exercise Paimon scans through a packaged two-worker Vane Ray runtime."""
+"""Exercise provider-backed Paimon through a packaged two-worker Vane runtime."""
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
+
+TEST_DIRECTORY = Path(__file__).resolve().parent
+# Isolated mode omits the script directory from sys.path; expose only this
+# sibling helper for the duration of its import.
+sys.path.insert(0, str(TEST_DIRECTORY))
+try:
+    from packaged_dynamic_extension import load_packaged_dynamic_paimon
+finally:
+    sys.path.pop(0)
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SCALAR_INDEX_PATH = REPOSITORY_ROOT / "data/scalar_index.db/t1"
@@ -86,16 +96,6 @@ def require_error(
 
 def sql_string(value: object) -> str:
     return "'" + str(value).replace("'", "''") + "'"
-
-
-def verify_extension_is_wheel_linked(connection: object) -> None:
-    extension = connection.execute(
-        "SELECT loaded, install_mode FROM duckdb_extensions() " "WHERE extension_name = 'paimon'"
-    ).fetchone()
-    if extension is None:
-        raise AssertionError("the packaged Vane wheel does not contain paimon")
-    require_equal(extension[1], "STATICALLY_LINKED", "Paimon install mode before LOAD")
-    connection.execute("LOAD paimon")
 
 
 def create_two_worker_cluster(ray: object) -> object:
@@ -737,12 +737,23 @@ def exercise_duplicate_retry_attempt_metadata(
     from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
     from vane.runners.local.runner import _InProcessFragmentExecutor
 
+    class PackagedPaimonFragmentExecutor(_InProcessFragmentExecutor):
+        def _get_conn(self) -> object:
+            existing = getattr(self._local, "conn", None)
+            connection = super()._get_conn()
+            if existing is None:
+                # This test backend intentionally bypasses Ray worker
+                # preparation, so prepare each thread-owned worker connection
+                # with the same installed provider as a real worker.
+                load_packaged_dynamic_paimon(connection)
+            return connection
+
     baseline_files = table_file_inventory(target_path)
     logical_plan = harness.capture_write_plan(
         lambda: source_insert_relation(harness, multi_path).insert_into(ATTEMPT_METADATA_INSERT_TARGET)
     )
     physical_plan = logical_plan.to_physical_plan(harness.connection)
-    executor = _InProcessFragmentExecutor()
+    executor = PackagedPaimonFragmentExecutor()
     backend = NativeFteWorkerManagerBackend(
         execute_fn=executor,
         num_workers=WORKER_COUNT,
@@ -1153,7 +1164,7 @@ def exercise_target_conflict_and_retry(
             },
         )
         try:
-            verify_extension_is_wheel_linked(mutation_connection)
+            load_packaged_dynamic_paimon(mutation_connection)
             warehouse = target_path.parent.parent
             mutation_connection.execute(f"ATTACH {sql_string(warehouse)} AS conflict_pm (TYPE paimon)")
             mutation_connection.execute(
@@ -1321,7 +1332,7 @@ def exercise_fail_closed_payloads(harness: RayPaimonHarness, multi_path: Path) -
         },
     )
     try:
-        verify_extension_is_wheel_linked(worker_connection)
+        load_packaged_dynamic_paimon(worker_connection)
         coordinator_worker = target_plan.clone(worker_connection)
         cross_plan_worker, malformed_worker = capture_worker_scan_plans(
             harness,
@@ -1392,7 +1403,7 @@ def main() -> None:
                 "autoload_known_extensions": "false",
             },
         )
-        verify_extension_is_wheel_linked(connection)
+        load_packaged_dynamic_paimon(connection)
         with tempfile.TemporaryDirectory(prefix="vane-paimon-ray-") as warehouse_text:
             warehouse = Path(warehouse_text).resolve()
             multi_path, empty_path, first_snapshot, second_snapshot, target_paths = create_paimon_fixture(

@@ -13,17 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exercise the statically linked Paimon extension in a packaged Vane wheel."""
+"""Exercise provider-backed Paimon from separately packaged Vane wheels."""
 
 from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 TABLE_PATH = REPOSITORY_ROOT / "data/testdb.db/testtbl"
+TEST_DIRECTORY = Path(__file__).resolve().parent
+# Isolated mode omits the script directory from sys.path; expose only this
+# sibling helper for the duration of its import.
+sys.path.insert(0, str(TEST_DIRECTORY))
+try:
+    from packaged_dynamic_extension import load_packaged_dynamic_paimon
+finally:
+    sys.path.pop(0)
 
 
 def require_equal(actual: object, expected: object, description: str) -> None:
@@ -33,21 +42,6 @@ def require_equal(actual: object, expected: object, description: str) -> None:
 
 def sql_string(value: object) -> str:
     return "'" + str(value).replace("'", "''") + "'"
-
-
-def verify_extension_is_wheel_linked(connection: object) -> None:
-    extension = connection.execute(
-        "SELECT loaded, install_mode FROM duckdb_extensions() " "WHERE extension_name = 'paimon'"
-    ).fetchone()
-    if extension is None:
-        raise AssertionError("the packaged Vane wheel does not contain paimon")
-    require_equal(extension[1], "STATICALLY_LINKED", "Paimon install mode before LOAD")
-
-    connection.execute("LOAD paimon")
-    loaded = connection.execute(
-        "SELECT loaded, install_mode FROM duckdb_extensions() " "WHERE extension_name = 'paimon'"
-    ).fetchone()
-    require_equal(loaded, (True, "STATICALLY_LINKED"), "Paimon after LOAD")
 
 
 def exercise_local_fast_insert(connection: object) -> None:
@@ -117,7 +111,7 @@ def main() -> None:
         },
     )
     try:
-        verify_extension_is_wheel_linked(connection)
+        load_packaged_dynamic_paimon(connection)
         scan = f"paimon_scan({sql_string(TABLE_PATH)})"
         require_equal(
             connection.execute(f"SELECT count(*)::BIGINT, min(f1), max(f1), round(sum(f3), 1) FROM {scan}").fetchone(),
