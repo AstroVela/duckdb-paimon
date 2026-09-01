@@ -23,8 +23,9 @@ from importlib.metadata import entry_points
 
 def load_packaged_dynamic_paimon(connection: object) -> None:
     """Validate and load the exact installed Paimon provider."""
-    import vane
     from vane.extensions import LocalExtensionProvider
+
+    import vane
 
     trust_identity = os.environ.get("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY")
     if not trust_identity:
@@ -50,12 +51,14 @@ def load_packaged_dynamic_paimon(connection: object) -> None:
     if artifact is None or artifact.descriptor != descriptor:
         raise AssertionError("the Paimon provider does not own its exact descriptor identity")
 
-    security = connection.execute("""
+    security = connection.execute(
+        """
         SELECT
             CAST(current_setting('allow_unsigned_extensions') AS BOOLEAN),
             CAST(current_setting('autoinstall_known_extensions') AS BOOLEAN),
             CAST(current_setting('autoload_known_extensions') AS BOOLEAN)
-        """).fetchone()
+        """
+    ).fetchone()
     if security != (False, False, False):
         raise AssertionError(f"dynamic extension security settings are not fail-closed: {security!r}")
 

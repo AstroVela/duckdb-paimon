@@ -111,7 +111,11 @@ ALLOWED_RUNTIME_LIBRARIES = frozenset(
     }
 )
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
-_PLATFORM_TAG_RE = re.compile(r"^manylinux_[0-9]+_[0-9]+_x86_64$")
+PROVIDER_PLATFORM_TAG = "manylinux_2_28_x86_64"
+_AUDITWHEEL_PLATFORM_RE = re.compile(
+    r'is consistent with the following platform tag:\s*"([^"]+)"'
+)
+_MANYLINUX_PLATFORM_RE = re.compile(r"^manylinux_([0-9]+)_([0-9]+)_x86_64$")
 
 
 class QualificationError(RuntimeError):
@@ -184,19 +188,40 @@ def _one_wheel(directory: Path, pattern: str, description: str) -> Path:
 def _platform_tag() -> str:
     if sys.platform != "linux" or platform.machine() != "x86_64":
         raise QualificationError("dynamic wheel qualification requires Linux x86_64")
-    tag = next(
-        (
-            candidate.platform
-            for candidate in sys_tags()
-            if candidate.platform.startswith("manylinux_")
-        ),
-        "",
-    )
-    if not _PLATFORM_TAG_RE.fullmatch(tag):
+    supported_platforms = {candidate.platform for candidate in sys_tags()}
+    if PROVIDER_PLATFORM_TAG not in supported_platforms:
         raise QualificationError(
-            f"could not resolve one exact manylinux x86_64 platform tag: {tag!r}"
+            f"build host does not support the required provider platform tag "
+            f"{PROVIDER_PLATFORM_TAG!r}"
         )
-    return tag
+    return PROVIDER_PLATFORM_TAG
+
+
+def _require_wheel_platform(wheel: Path, expected: str) -> None:
+    expected_match = _MANYLINUX_PLATFORM_RE.fullmatch(expected)
+    if expected_match is None:
+        raise QualificationError(f"invalid expected manylinux platform: {expected!r}")
+    if not wheel.name.endswith(f"-{expected}.whl"):
+        raise QualificationError(
+            f"{wheel.name} is not tagged for the required platform {expected!r}"
+        )
+    report = _capture(
+        (sys.executable, "-m", "auditwheel", "show", str(wheel)),
+        cwd=wheel.parent,
+    )
+    reported = _AUDITWHEEL_PLATFORM_RE.findall(report)
+    reported_versions = [
+        (int(match.group(1)), int(match.group(2)))
+        for tag in reported
+        for candidate in tag.split(".")
+        if (match := _MANYLINUX_PLATFORM_RE.fullmatch(candidate)) is not None
+    ]
+    expected_version = (int(expected_match.group(1)), int(expected_match.group(2)))
+    if len(reported) != 1 or not reported_versions or max(reported_versions) > expected_version:
+        raise QualificationError(
+            f"{wheel.name} has auditwheel platform {reported!r}, which is not "
+            f"compatible with the required ceiling {expected!r}"
+        )
 
 
 def _compiler_launcher_arguments() -> list[str]:
@@ -763,6 +788,7 @@ def main() -> int:
             repaired_base = _one_wheel(
                 repaired_base_directory, "vane_ai-*.whl", "repaired base Vane wheel"
             )
+            _require_wheel_platform(repaired_base, platform_tag)
 
             builder_environment, builder_python = _builder_python(
                 base_wheel, build_directory.parent
@@ -776,6 +802,7 @@ def main() -> int:
                     platform_tag=platform_tag,
                     license_files=licenses,
                 )
+                _require_wheel_platform(provider_wheel, platform_tag)
                 _run(
                     (
                         str(builder_python),

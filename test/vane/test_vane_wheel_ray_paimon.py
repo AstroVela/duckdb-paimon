@@ -28,6 +28,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 TEST_DIRECTORY = Path(__file__).resolve().parent
+# Isolated mode omits the script directory from sys.path; expose only this
+# sibling helper for the duration of its import.
 sys.path.insert(0, str(TEST_DIRECTORY))
 try:
     from packaged_dynamic_extension import load_packaged_dynamic_paimon

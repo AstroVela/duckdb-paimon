@@ -25,6 +25,8 @@ jobs:
   vane-dynamic-wheel:
     name: Build signed Vane dynamic Paimon wheel
     runs-on: ubuntu-24.04
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:0bf9db09181f36be8cf0628332abb5d31855b7d0f372faa776f492ccd9d3100d
     timeout-minutes: 240
     permissions:
       contents: read
@@ -39,6 +41,7 @@ jobs:
       VANE_BUILD_JOBS: 12
       VANE_CMAKE_COMPILER_LAUNCHER: ccache
       VCPKG_TARGET_TRIPLET: x64-linux
+      VCPKG_BINARY_SOURCES: clear
       CCACHE_DIR: ${{ github.workspace }}/.cache/vane-dynamic-wheel-ccache
       CCACHE_MAXSIZE: 1G
       CCACHE_COMPILERCHECK: content
@@ -52,10 +55,14 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
-        with:
-          python-version: "3.12"
+      - name: Select manylinux CPython
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_directory=/opt/python/cp312-cp312/bin
+          test -x "$python_directory/python"
+          echo "$python_directory" >> "$GITHUB_PATH"
+          "$python_directory/python" --version
 
       - name: Read integration manifest
         id: manifest
@@ -96,20 +103,28 @@ jobs:
             --vane-source "$VANE_SOURCE_DIR"
 
       - name: Install native and wheel tooling
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          set -euo pipefail
+          dnf install -y \
             autoconf \
             automake \
             bison \
-            build-essential \
             ccache \
             curl \
+            file \
             flex \
+            gcc \
+            gcc-c++ \
+            git \
             libtool \
+            make \
             ninja-build \
             openssl \
-            pkg-config \
+            openssl-devel \
+            patch \
+            perl-IPC-Cmd \
+            pkgconf-pkg-config \
             tar \
             unzip \
             zip
@@ -129,7 +144,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: vane-paimon-dynamic-wheel-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.manifest.outputs.vane_revision }}-${{ hashFiles('extension/vcpkg.json', 'extension/third_party/paimon-cpp/third_party/versions.txt') }}
+          key: vane-paimon-dynamic-wheel-ccache-v2-manylinux_2_28-${{ runner.arch }}-${{ steps.manifest.outputs.vane_revision }}-${{ hashFiles('extension/vcpkg.json', 'extension/third_party/paimon-cpp/third_party/versions.txt') }}
 
       - name: Reset dynamic-wheel compiler cache statistics
         run: ccache --zero-stats
