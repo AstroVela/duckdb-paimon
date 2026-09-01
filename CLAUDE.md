@@ -24,6 +24,7 @@ make test # run tests (release)
 ## Branches
 
 - `main` — targets DuckDB 1.5
+- `main_vane` — targets Vane integration and provider releases on DuckDB 1.5
 - `v1.4-andium` — targets DuckDB 1.4
 
 ## paimon-cpp submodule
