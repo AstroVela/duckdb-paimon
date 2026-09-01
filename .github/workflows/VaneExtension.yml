@@ -124,6 +124,7 @@ jobs:
             openssl-devel \
             patch \
             perl-IPC-Cmd \
+            perl-Time-Piece \
             pkgconf-pkg-config \
             tar \
             unzip \
