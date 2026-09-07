@@ -17,10 +17,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
+import json
+import subprocess
 import sys
 import tempfile
+import tomllib
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -79,132 +81,66 @@ def write_release(directory: Path) -> tuple[Path, ...]:
     return tuple(write_wheel(directory, interpreter) for interpreter in INTERPRETERS)
 
 
-def sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def exercise_release_validator(validator: ModuleType) -> None:
+    config_path = REPOSITORY_ROOT / "vane-provider-release.toml"
+    config = validator.load_config(config_path)
+    if config.interpreters != INTERPRETERS or config.platforms != (PLATFORM,):
+        raise AssertionError("release config differs from the built wheel matrix")
+    if len(config.providers) != 1 or config.providers[0].name != "paimon":
+        raise AssertionError("Paimon must publish exactly its own provider")
+    if config.providers[0].distribution != "vane-extension-paimon" or config.providers[0].dependencies:
+        raise AssertionError("Paimon must depend only on vane-ai")
+
+    # Generic matrix/index cases live in vane-extension-ci-tools. Keep this a
+    # consumer smoke test of the real config, CLI and GitHub job output names.
     with tempfile.TemporaryDirectory(prefix="vane-paimon-release-validator-") as value:
         directory = Path(value)
-        wheels = write_release(directory)
-        actual_version = validator.validate_release(directory, VANE_VERSION)
-        if actual_version != PAIMON_VERSION:
-            raise AssertionError(f"expected Paimon version {PAIMON_VERSION}, got {actual_version}")
-
-        expected_hashes = {wheel.name: sha256(wheel) for wheel in wheels}
-        original_request = validator._request_json
-        try:
-            validator._request_json = lambda _url: (404, None)
-            validator.require_index_publishable(directory, PAIMON_VERSION)
-
-            indexed_subset = {
-                "urls": [
-                    {
-                        "digests": {"sha256": sha256(wheels[0])},
-                        "filename": wheels[0].name,
-                        "packagetype": "bdist_wheel",
-                    }
-                ]
-            }
-            validator._request_json = lambda _url: (200, indexed_subset)
-            validator.require_index_publishable(directory, PAIMON_VERSION)
-
-            indexed_complete = {
-                "urls": [
-                    {
-                        "digests": {"sha256": digest},
-                        "filename": filename,
-                        "packagetype": "bdist_wheel",
-                    }
-                    for filename, digest in expected_hashes.items()
-                ]
-            }
-            validator._request_json = lambda _url: (200, indexed_complete)
-            validator.require_index_match(
-                directory,
-                PAIMON_VERSION,
-                attempts=1,
-                delay_seconds=0,
-            )
-
-            conflict = {
-                "urls": [
-                    {
-                        "digests": {"sha256": "0" * 64},
-                        "filename": wheels[0].name,
-                        "packagetype": "bdist_wheel",
-                    }
-                ]
-            }
-            validator._request_json = lambda _url: (200, conflict)
-            require_error(
-                validator.ReleaseValidationError,
-                lambda: validator.require_index_publishable(directory, PAIMON_VERSION),
-            )
-        finally:
-            validator._request_json = original_request
-
-        wheels[-1].unlink()
-        require_error(
-            validator.ReleaseValidationError,
-            lambda: validator.validate_release(directory, VANE_VERSION),
-        )
-
-    with tempfile.TemporaryDirectory(prefix="vane-paimon-release-dependency-") as value:
-        directory = Path(value)
         write_release(directory)
-        invalid = directory / (f"vane_extension_paimon-{PAIMON_VERSION}-cp314-none-{PLATFORM}.whl")
-        invalid.unlink()
+        versions = validator.validate_release(directory, VANE_VERSION, config)
+        if versions != {"paimon": PAIMON_VERSION}:
+            raise AssertionError(f"unexpected provider versions: {versions}")
+        outputs = directory / "github-output"
+        command = [
+            sys.executable,
+            "-I",
+            str(Path(validator.__file__)),
+            "validate",
+            "--config",
+            str(config_path),
+            "--directory",
+            str(directory),
+            "--vane-version",
+            VANE_VERSION,
+            "--github-output",
+            str(outputs),
+        ]
+        result = subprocess.run(command, text=True, capture_output=True, check=True)
+        expected = {"vane_version": VANE_VERSION, "paimon_version": PAIMON_VERSION}
+        if json.loads(result.stdout) != expected:
+            raise AssertionError("shared CLI returned different workflow output names")
+        if dict(line.split("=", 1) for line in outputs.read_text().splitlines()) != expected:
+            raise AssertionError("shared CLI did not write the expected GitHub outputs")
         write_wheel(directory, "cp314", requirement="vane-ai>=0.2")
-        require_error(
-            validator.ReleaseValidationError,
-            lambda: validator.validate_release(directory, VANE_VERSION),
-        )
+        result = subprocess.run(command, text=True, capture_output=True)
+        if result.returncode != 2:
+            raise AssertionError("shared CLI accepted an inexact Vane dependency")
 
-    with tempfile.TemporaryDirectory(prefix="vane-paimon-release-index-tags-") as value:
-        directory = Path(value)
-        wheels = write_release(directory)
-        wheels[-1].unlink()
-        write_wheel(directory, "cp39")
-        original_request = validator._request_json
-        try:
-            validator._request_json = lambda _url: (404, None)
-            require_error(
-                validator.ReleaseValidationError,
-                lambda: validator.require_index_publishable(directory, PAIMON_VERSION),
-            )
-        finally:
-            validator._request_json = original_request
 
-    with tempfile.TemporaryDirectory(prefix="vane-paimon-release-index-metadata-") as value:
-        directory = Path(value)
-        wheels = write_release(directory)
-        wheels[-1].unlink()
-        write_wheel(directory, "cp314", metadata_name="vane-extension-not-paimon")
-        indexed_complete = {
-            "urls": [
-                {
-                    "digests": {"sha256": sha256(wheel)},
-                    "filename": wheel.name,
-                    "packagetype": "bdist_wheel",
-                }
-                for wheel in sorted(directory.glob("*.whl"))
-            ]
-        }
-        original_request = validator._request_json
-        try:
-            validator._request_json = lambda _url: (200, indexed_complete)
-            require_error(
-                validator.ReleaseValidationError,
-                lambda: validator.require_index_match(
-                    directory,
-                    PAIMON_VERSION,
-                    attempts=1,
-                    delay_seconds=0,
-                ),
-            )
-        finally:
-            validator._request_json = original_request
+def exercise_integration_pins() -> None:
+    with (REPOSITORY_ROOT / "vane-extension.toml").open("rb") as source:
+        manifest = tomllib.load(source)
+    vcpkg = json.loads((REPOSITORY_ROOT / "vcpkg.json").read_text())
+    if manifest["schema_version"] != 2 or manifest["vcpkg"]["repository"] != "microsoft/vcpkg":
+        raise AssertionError("integration must use the current explicit-vcpkg contract")
+    if manifest["vcpkg"]["revision"] != vcpkg["builtin-baseline"]:
+        raise AssertionError("native and dynamic Paimon lanes must use the same reviewed vcpkg revision")
+    tools = REPOSITORY_ROOT / "vane-extension-ci-tools"
+    actual = subprocess.check_output(["git", "-C", str(tools), "rev-parse", "HEAD"], text=True).strip()
+    workflow = (REPOSITORY_ROOT / ".github/workflows/VaneExtension.yml").read_text()
+    if workflow.count(actual) != 4:
+        raise AssertionError("all four workflow CI-tools pins must match the shared checkout")
+    if "scripts/validate_vane_provider_release.py" in workflow:
+        raise AssertionError("workflow still invokes a private release validator")
 
 
 def exercise_private_key_consumption(builder: ModuleType) -> None:
@@ -245,7 +181,7 @@ def exercise_private_key_consumption(builder: ModuleType) -> None:
 def main() -> None:
     validator = load_script(
         "vane_paimon_release_validator",
-        "scripts/validate_vane_provider_release.py",
+        "vane-extension-ci-tools/scripts/vane_provider_release.py",
     )
     builder = load_script(
         "vane_paimon_dynamic_wheel_builder",
@@ -253,6 +189,7 @@ def main() -> None:
     )
     try:
         exercise_release_validator(validator)
+        exercise_integration_pins()
         exercise_private_key_consumption(builder)
     finally:
         sys.modules.pop(validator.__name__, None)
