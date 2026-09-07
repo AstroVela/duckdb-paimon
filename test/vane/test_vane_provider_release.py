@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -25,8 +26,10 @@ import tempfile
 import tomllib
 import zipfile
 from collections.abc import Callable
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import ModuleType
+from unittest import mock
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 VANE_VERSION = "0.2.0.dev612"
@@ -101,10 +104,15 @@ def exercise_release_validator(validator: ModuleType) -> None:
             raise AssertionError(f"unexpected provider versions: {versions}")
         outputs = directory / "github-output"
         command = [
-            sys.executable,
-            "-I",
-            str(Path(validator.__file__)),
             "validate",
+            "--manifest",
+            str(REPOSITORY_ROOT / "vane-extension.toml"),
+            "--extension-root",
+            str(REPOSITORY_ROOT),
+            "--vane-source",
+            str(directory / "vane"),
+            "--ci-tools-version",
+            "a" * 40,
             "--config",
             str(config_path),
             "--directory",
@@ -114,16 +122,22 @@ def exercise_release_validator(validator: ModuleType) -> None:
             "--github-output",
             str(outputs),
         ]
-        result = subprocess.run(command, text=True, capture_output=True, check=True)
+        output = io.StringIO()
+        with mock.patch.object(validator, "verify_sources") as verify, redirect_stdout(output):
+            if validator.main(command) != 0:
+                raise AssertionError("shared CLI rejected the configured Paimon matrix")
+        verify.assert_called_once_with(
+            REPOSITORY_ROOT / "vane-extension.toml", REPOSITORY_ROOT, directory / "vane", "a" * 40
+        )
         expected = {"vane_version": VANE_VERSION, "paimon_version": PAIMON_VERSION}
-        if json.loads(result.stdout) != expected:
+        if json.loads(output.getvalue()) != expected:
             raise AssertionError("shared CLI returned different workflow output names")
         if dict(line.split("=", 1) for line in outputs.read_text().splitlines()) != expected:
             raise AssertionError("shared CLI did not write the expected GitHub outputs")
         write_wheel(directory, "cp314", requirement="vane-ai>=0.2")
-        result = subprocess.run(command, text=True, capture_output=True)
-        if result.returncode != 2:
-            raise AssertionError("shared CLI accepted an inexact Vane dependency")
+        with mock.patch.object(validator, "verify_sources"), redirect_stderr(io.StringIO()):
+            if validator.main(command) != 2:
+                raise AssertionError("shared CLI accepted an inexact Vane dependency")
 
 
 def exercise_integration_pins() -> None:

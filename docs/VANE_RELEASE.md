@@ -19,11 +19,20 @@ For a locally assembled TestPyPI candidate set:
 
 ```bash
 python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
+  --manifest vane-extension.toml --extension-root . \
+  --vane-source ../vane \
+  --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
   --directory build/vane-testpypi-wheel-dist \
   --vane-version 0.2.0.dev612 \
   --require-testpypi-publishable
 ```
+
+The Vane checkout must already exist at the exact manifest revision. The shared
+gate verifies both official source revisions and rejects dirty or mismatched
+Vane/tools checkouts before accepting wheels. Assembly and index-verification
+jobs use a shallow checkout of that exact Vane revision; no native build or
+version derivation is needed in these jobs.
 
 `VaneExtension.yml` uses this shared gate before upload and compares the exact
 indexed wheel filenames and SHA-256 digests after upload. The workflow's

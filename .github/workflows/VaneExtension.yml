@@ -25,9 +25,9 @@ jobs:
   vane-extension:
     if: inputs.operation != 'testpypi-dev'
     # The called workflow verifies its exact SHA from GitHub job metadata.
-    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@0d9600162921c78f9cdd333b1372ccd34c5b6d47
+    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@7ff8a248e974ca88e2ef5e83e71e5440a334390c
     with:
-      ci_tools_version: 0d9600162921c78f9cdd333b1372ccd34c5b6d47
+      ci_tools_version: 7ff8a248e974ca88e2ef5e83e71e5440a334390c
       manifest: vane-extension.toml
       build_jobs: 12
       run_native_tests: true
@@ -124,7 +124,7 @@ jobs:
       - name: Validate exact Vane and CI-tools identities
         shell: bash
         env:
-          VANE_CI_TOOLS_VERSION: 0d9600162921c78f9cdd333b1372ccd34c5b6d47
+          VANE_CI_TOOLS_VERSION: 7ff8a248e974ca88e2ef5e83e71e5440a334390c
         run: |
           set -euo pipefail
           actual_ci_tools="$(git -C extension/vane-extension-ci-tools rev-parse HEAD)"
@@ -532,7 +532,7 @@ jobs:
       - name: Validate exact Vane and CI-tools identities
         shell: bash
         env:
-          VANE_CI_TOOLS_VERSION: 0d9600162921c78f9cdd333b1372ccd34c5b6d47
+          VANE_CI_TOOLS_VERSION: 7ff8a248e974ca88e2ef5e83e71e5440a334390c
         run: |
           set -euo pipefail
           actual_ci_tools="$(git -C extension/vane-extension-ci-tools rev-parse HEAD)"
@@ -683,6 +683,9 @@ jobs:
         shell: bash
         run: |
           "$VANE_PYTHON" -I extension/vane-extension-ci-tools/scripts/vane_provider_release.py validate \
+            --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
+            --vane-source "$VANE_SOURCE_DIR" \
+            --ci-tools-version "$(git -C "$VANE_EXTENSION_ROOT" rev-parse HEAD:vane-extension-ci-tools)" \
             --config extension/vane-provider-release.toml \
             --directory "$VANE_DYNAMIC_DIST_DIR" \
             --vane-version "${{ steps.vane_candidate.outputs.version }}" \
@@ -736,6 +739,22 @@ jobs:
       - name: Install release validation tooling
         run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
 
+      - name: Read exact Vane source pin
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension.toml --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source for release verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 1
+          persist-credentials: false
+
       - name: Download Paimon provider wheels
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
@@ -745,6 +764,9 @@ jobs:
       - name: Revalidate the complete release set
         run: |
           python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
+            --manifest vane-extension.toml --extension-root . \
+            --vane-source vane \
+            --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
             --config vane-provider-release.toml \
             --directory packages \
             --vane-version "${{ needs.vane-testpypi-wheels.outputs.vane_version }}" \
@@ -849,6 +871,22 @@ jobs:
       - name: Install release validation tooling
         run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
 
+      - name: Read exact Vane source pin
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension.toml --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source for release verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 1
+          persist-credentials: false
+
       - name: Download Paimon distributions
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
@@ -858,6 +896,9 @@ jobs:
       - name: Compare the immutable indexed release
         run: |
           python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-index \
+            --manifest vane-extension.toml --extension-root . \
+            --vane-source vane \
+            --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
             --config vane-provider-release.toml \
             --provider paimon \
             --directory dist \
