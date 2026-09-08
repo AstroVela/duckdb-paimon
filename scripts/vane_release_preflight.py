@@ -8,10 +8,13 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
+
+from packaging.utils import parse_wheel_filename
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION_KEY_REVISION = "033b549afcb498633fd6669b26c054c00363004e"
@@ -72,6 +75,47 @@ def require_production_ancestry(source: Path) -> None:
         )
 
 
+def require_indexed_runtime(release, version: str, channel: str, config: Path) -> None:
+    index = "pypi" if channel == "release" else "testpypi"
+    status, document = release._request_json(
+        f"{release.INDEX_JSON_BASES[index]}/vane-ai/{version}/json"
+    )
+    if status != 200 or not isinstance(document, dict):
+        raise ValueError(f"exact Vane runtime {version} is not published on {index}")
+    files = document.get("urls")
+    if not isinstance(files, list):
+        raise ValueError("runtime index returned an invalid file list")
+    expected = release.load_config(config)
+    found = set()
+    for record in files:
+        if not isinstance(record, dict):
+            raise ValueError("runtime index returned an invalid file record")
+        if record.get("packagetype") != "bdist_wheel":
+            continue
+        distribution, wheel_version, _, tags = parse_wheel_filename(record["filename"])
+        if distribution != "vane-ai" or str(wheel_version) != version:
+            raise ValueError("runtime index returned an unexpected wheel identity")
+        if record.get("yanked", False) is not False:
+            continue
+        digest = record.get("digests", {}).get("sha256", "")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError("runtime index returned an invalid wheel digest")
+        found.update(
+            (tag.interpreter, tag.platform)
+            for tag in tags
+            if tag.abi == tag.interpreter
+        )
+    required = {
+        (interpreter, platform)
+        for interpreter in expected.interpreters
+        for platform in expected.platforms
+    }
+    if not required <= found:
+        raise ValueError(
+            f"exact Vane runtime is missing indexed wheels: {required - found}"
+        )
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -98,6 +142,12 @@ def main(argv: list[str] | None = None) -> None:
         require_production_ancestry(arguments.vane_source)
     version = source_version(arguments.vane_source)
     tools.validate_vane_version(version, arguments.operation)
+    require_indexed_runtime(
+        tools,
+        version,
+        arguments.operation,
+        REPOSITORY_ROOT / "vane-provider-release.toml",
+    )
     with arguments.github_output.open("a", encoding="utf-8") as output:
         output.write(f"vane_version={version}\n")
     print(f"Validated {arguments.operation} Vane source version: {version}")

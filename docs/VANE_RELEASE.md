@@ -91,24 +91,44 @@ To activate production later:
    No provider tag is required or created. Approve signing only after reviewing
    the exact source pin, then approve `pypi` only after qualification succeeds.
 
-The release job builds and RSA-signs the Paimon binary once, packages its complete
-wheel matrix against the exact indexed runtime wheels, and runs Vane's native
-signature, SourceID, platform and dependency checks. Both testing trust roots are
-explicitly disabled. Signing-key files are consumed before native subprocesses;
-the private key is never an artifact. A missing production secret cannot select
-the development secret.
+Both publishing operations use three isolated jobs. A key-free `prepare` phase
+builds Paimon once, audits its native dependencies and uploads only the unsigned
+`artifacts/paimon.duckdb_extension` plus the flat `licenses/paimon/` text bundle.
+An environment-protected signer downloads that original artifact by ID, reads
+the committed manifest itself, and uses only system Python (`-I -S`), its standard
+library and system OpenSSL. It does not install dependencies or load native data.
+It checks the selected public-key fingerprint, signs the fixed bounded native
+file as data using the exact reviewed Vane utility, and removes its mode-600
+temporary private key even on failure. Only the signed native file is uploaded.
+
+A fresh key-free `package` job downloads both original artifact IDs, verifies
+that signing changed only the signature footer, then packages the complete wheel
+matrix against exact indexed runtime wheels. It reuses the prepared licenses,
+without rebuilding or signing, and runs Vane's native signature, SourceID,
+platform and dependency checks. Production explicitly disables both testing
+trust roots. No mutable build, pip or native-verification dependency runs in a
+job with the private key; the private key is never an artifact. The existing
+CI-only `full` path can use only the public CI fixture key. A missing production
+secret cannot select the development secret.
 
 Those same wheels are staged on TestPyPI. Both local and two-worker Ray tests
 download the staged provider, compare its bytes to the digest-verified candidate
 artifact, and use the production runtime from PyPI. No mixed-index resolver or
 runtime fallback is used. Ordinary runtime dependencies still come from PyPI.
 
-Only after both tests succeed does the `pypi` approval job start. After approval,
-the shared `verify-promotion` gate rechecks the complete staged filenames and
-SHA-256 hashes and rejects conflicting PyPI files. The upload uses that unchanged
-directory; no rebuild, resigning or version rewrite occurs. A final
-`verify-index --index pypi` checks the complete indexed matrix. Identical partial
-uploads can be retried; different files under an existing version fail closed.
+Only after both tests succeed does the `pypi` approval-gated verification job
+start. After approval, the shared `verify-promotion` gate rechecks the complete
+staged filenames and SHA-256 hashes and rejects conflicting PyPI files. This job
+has read-only permissions and cannot obtain publishing OIDC tokens.
+
+The dependent publisher is also gated by the `pypi` environment. It only downloads
+the original digest-verified candidate artifact and invokes the pinned PyPI
+publishing action. No repository checkout, Python tooling installation or release
+validator runs in the OIDC-authorized publisher. No rebuild, resigning or version
+rewrite occurs; GitHub may request another approval for that publisher job. A
+separate read-only `verify-index --index pypi` job checks the
+complete indexed matrix after upload. Identical partial uploads can be retried;
+different files under an existing version fail closed.
 
 Environment protection, secrets and Trusted Publisher registration are explicit
 administrator setup steps; merging this preparation does not configure them or

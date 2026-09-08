@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import io
@@ -31,7 +32,7 @@ import zipfile
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import yaml
@@ -257,25 +258,62 @@ def exercise_workflow_contract() -> None:
     preflight = jobs["vane-release-preflight"]
     if "environment" in preflight or preflight["permissions"] != {"contents": "read"}:
         raise AssertionError("preflight must not have publishing authority or a signing environment")
-    build = jobs["vane-testpypi-wheels"]
-    if build["needs"] != "vane-release-preflight":
-        raise AssertionError("the signing job must wait for the secret-free source/version gate")
-    download_index = next(i for i, step in enumerate(build["steps"]) if step.get("id") == "vane_candidate")
-    native_index = next(
-        i for i, step in enumerate(build["steps"]) if step["name"] == "Install native and wheel tooling"
-    )
-    if download_index >= native_index:
-        raise AssertionError("missing indexed Vane runtimes must fail before native preparation")
-    if "'production-signing'" not in build["environment"]["name"]:
+    prepare = jobs["vane-testpypi-prepare"]
+    package = jobs["vane-testpypi-wheels"]
+    signing = jobs["vane-testpypi-sign"]
+    if prepare["needs"] != "vane-release-preflight" or signing["needs"] != "vane-testpypi-prepare":
+        raise AssertionError("signing must wait for the source/index gate and unsigned native preparation")
+    if set(package["needs"]) != {"vane-release-preflight", "vane-testpypi-prepare", "vane-testpypi-sign"}:
+        raise AssertionError("fresh packaging requires the original unsigned and isolated signed artifacts")
+    for job, phase in ((prepare, "prepare"), (package, "package")):
+        scripts = "\n".join(step.get("run", "") for step in job["steps"])
+        if "environment" in job or "secrets" in str(job) or job["permissions"] != {"contents": "read"}:
+            raise AssertionError("native build and wheel dependencies must not have signing or publishing authority")
+        if f"--phase {phase}" not in scripts or "--signing-private-key" in scripts:
+            raise AssertionError("publishing must use explicit key-free builder phases")
+    if "'production-signing'" not in signing["environment"]["name"]:
         raise AssertionError("production signing needs its separate protected environment")
-    signing = next(
-        step for step in build["steps"] if step["name"] == "Build, sign and verify the Paimon provider wheel matrix"
-    )
-    if signing["env"]["VANE_SELECTED_SIGNING_PRIVATE_KEY"] != (
+    if signing["permissions"] != {"contents": "read"}:
+        raise AssertionError("native signing must not have publishing OIDC")
+    for step in signing["steps"]:
+        if "uses" in step and not step["uses"].startswith(
+            ("actions/checkout@", "actions/download-artifact@", "actions/upload-artifact@")
+        ):
+            raise AssertionError("signing may use only pinned checkout and artifact actions")
+        if "run" in step and not step["run"].startswith(
+            "/usr/bin/python3 -I -S extension/scripts/sign_vane_dynamic_bundle.py "
+        ):
+            raise AssertionError("the signer may execute only the isolated stdlib wrapper")
+    source = next(step for step in signing["steps"] if step["name"] == "Checkout the committed Vane signing utility")
+    if (
+        source["with"]["repository"] != "AstroVela/vane"
+        or source["with"]["ref"] != "${{ steps.manifest.outputs.vane_revision }}"
+    ):
+        raise AssertionError("the signer must choose official Vane source from its own committed manifest")
+    signing_step = next(step for step in signing["steps"] if "VANE_PROVIDER_SIGNING_PRIVATE_KEY" in step.get("env", {}))
+    if signing_step["env"]["VANE_PROVIDER_SIGNING_PRIVATE_KEY"] != (
         "${{ secrets[inputs.operation == 'release' && 'VANE_EXTENSION_SIGNING_PRIVATE_KEY' || "
         "'VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY'] }}"
     ):
         raise AssertionError("a missing production secret must never select the development secret")
+    for job_name in (
+        "vane-testpypi-sign",
+        "vane-testpypi-wheels",
+        "assemble-testpypi-paimon",
+        "publish-testpypi-paimon",
+        "verify-testpypi-paimon",
+        "testpypi-local-paimon-integration",
+        "testpypi-ray-paimon-integration",
+        "verify-pypi-promotion",
+        "publish-pypi-paimon",
+        "verify-pypi-paimon",
+    ):
+        for step in jobs[job_name]["steps"]:
+            if step.get("uses", "").startswith("actions/download-artifact@"):
+                if "name" in step["with"] or not step["with"].get("artifact-ids", "").endswith(
+                    ".outputs.artifact_id }}"
+                ):
+                    raise AssertionError("publishing consumers must use original immutable artifact IDs")
     for job in jobs.values():
         for step in job.get("steps", []):
             if step.get("uses", "").startswith("actions/download-artifact@"):
@@ -291,17 +329,43 @@ def exercise_workflow_contract() -> None:
             raise AssertionError("both indexed smoke jobs must execute the exact candidate bytes")
         if "'https://pypi.org/simple/'" not in smoke["env"]["RUNTIME_INDEX_URL"]:
             raise AssertionError("production smoke runtimes must come from PyPI")
-    promotion = jobs["publish-pypi-paimon"]
+    promotion = jobs["verify-pypi-promotion"]
     if set(promotion["needs"]) != smoke_jobs | {"assemble-testpypi-paimon"}:
         raise AssertionError("PyPI promotion requires both successful smoke jobs and the same candidate set")
     if promotion["if"] != "inputs.operation == 'release'" or promotion["environment"]["name"] != "pypi":
         raise AssertionError("only release dispatches may enter the production approval environment")
-    steps = promotion["steps"]
-    verify = next(i for i, step in enumerate(steps) if "verify-promotion" in step.get("run", ""))
-    upload = next(i for i, step in enumerate(steps) if step.get("uses", "").startswith("pypa/gh-action-pypi-publish@"))
-    if verify + 1 != upload or steps[upload]["with"]["packages-dir"] != "dist":
-        raise AssertionError("fresh promotion verification must immediately precede uploading the same directory")
-    if "--index pypi" not in steps[upload + 1]["run"]:
+    if promotion["permissions"] != {"contents": "read"}:
+        raise AssertionError("release validation dependencies must never run with publishing OIDC")
+    if "verify-promotion" not in promotion["steps"][-1]["run"]:
+        raise AssertionError("promotion must be rechecked after approval")
+    publisher = jobs["publish-pypi-paimon"]
+    if (
+        set(publisher["needs"]) != {"verify-pypi-promotion", "assemble-testpypi-paimon"}
+        or publisher["environment"]["name"] != "pypi"
+    ):
+        raise AssertionError("the protected publisher must wait for immutable promotion verification")
+    steps = publisher["steps"]
+    if len(steps) != 2 or any("run" in step for step in steps):
+        raise AssertionError(
+            "the OIDC publisher must only download the original artifact and invoke the pinned upload action"
+        )
+    if (
+        not steps[0]["uses"].startswith("actions/download-artifact@")
+        or steps[0]["with"].get("artifact-ids") != "${{ needs.assemble-testpypi-paimon.outputs.artifact_id }}"
+        or "name" in steps[0]["with"]
+    ):
+        raise AssertionError("the publisher must use the original tested distribution artifact")
+    if (
+        steps[1]["uses"] != "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
+        or steps[1]["with"]["packages-dir"] != steps[0]["with"]["path"]
+    ):
+        raise AssertionError("the pinned publishing action must upload the unchanged artifact directory")
+    indexed = jobs["verify-pypi-paimon"]
+    if set(indexed["needs"]) != {"assemble-testpypi-paimon", "publish-pypi-paimon"} or indexed["permissions"] != {
+        "contents": "read"
+    }:
+        raise AssertionError("post-upload index verification must be a separate OIDC-free job")
+    if "--index pypi" not in indexed["steps"][-1]["run"]:
         raise AssertionError("the complete production index must be verified after publishing")
 
 
@@ -350,9 +414,13 @@ def exercise_preflight(preflight: ModuleType, validator: ModuleType) -> None:
             mock.patch.object(validator, "verify_sources"),
             mock.patch.object(preflight, "require_production_ancestry"),
             mock.patch.object(preflight, "source_version", return_value="0.2.0"),
+            mock.patch.object(preflight, "require_indexed_runtime") as indexed,
             redirect_stdout(io.StringIO()),
         ):
             preflight.main(command)
+            indexed.assert_called_once_with(
+                validator, "0.2.0", "release", REPOSITORY_ROOT / "vane-provider-release.toml"
+            )
         if output.read_text() != "vane_version=0.2.0\n":
             raise AssertionError("a valid formal source version must remain exact")
     with (
@@ -384,15 +452,9 @@ def exercise_preflight(preflight: ModuleType, validator: ModuleType) -> None:
             require_error(ValueError, lambda: preflight.require_production_ancestry(Path("vane")))
 
 
-def exercise_production_signing(builder: ModuleType) -> None:
+def exercise_production_signing(builder: ModuleType, signer: ModuleType) -> None:
     if builder.SIGNING_PROFILES["production"] != ("astrovela/vane", None):
         raise AssertionError("production must use the default native trust store")
-    builder._require_signing_mode("production", consume=True, local_runtime=False)
-    for consume, local in ((False, False), (True, True), (False, True)):
-        require_error(
-            builder.QualificationError,
-            lambda: builder._require_signing_mode("production", consume=consume, local_runtime=local),
-        )
     # Generate an isolated throwaway key, not the developer's production key.
     private = bytearray(
         subprocess.run(
@@ -410,12 +472,13 @@ def exercise_production_signing(builder: ModuleType) -> None:
             stderr=subprocess.PIPE,
             check=True,
         ).stdout
-        require_error(builder.QualificationError, lambda: builder._require_production_key(private))
-        with mock.patch.object(builder, "PRODUCTION_PUBLIC_KEY_SHA256", hashlib.sha256(public).hexdigest()):
-            builder._require_production_key(private)
-        require_error(
-            builder.QualificationError, lambda: builder._require_production_key(bytearray(b"invalid private key"))
-        )
+        for profile in ("production", "testpypi"):
+            require_error(ValueError, lambda: signer.require_key_fingerprint(private, profile))
+            with mock.patch.dict(signer.KEY_FINGERPRINTS, {profile: hashlib.sha256(public).hexdigest()}):
+                signer.require_key_fingerprint(private, profile)
+            require_error(
+                ValueError, lambda: signer.require_key_fingerprint(bytearray(b"invalid private key"), profile)
+            )
     finally:
         private[:] = b"\0" * len(private)
         private.clear()
@@ -451,6 +514,231 @@ def exercise_production_signing(builder: ModuleType) -> None:
         for option in ("VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY", "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY"):
             if f"-D{option}=OFF" not in options or f"-D{option}=ON" in options:
                 raise AssertionError("production builds must explicitly disable both testing trust roots")
+
+
+def exercise_runtime_index(preflight: ModuleType, validator: ModuleType) -> None:
+    config = REPOSITORY_ROOT / "vane-provider-release.toml"
+    files = [
+        {
+            "filename": f"vane_ai-0.2.0-{interpreter}-{interpreter}-{PLATFORM}.whl",
+            "packagetype": "bdist_wheel",
+            "digests": {"sha256": "a" * 64},
+            "yanked": False,
+        }
+        for interpreter in INTERPRETERS
+    ]
+    for channel, host in (("release", "pypi.org"), ("testpypi-dev", "test.pypi.org")):
+        with mock.patch.object(validator, "_request_json", return_value=(200, {"urls": files})) as request:
+            preflight.require_indexed_runtime(validator, "0.2.0", channel, config)
+            request.assert_called_once_with(f"https://{host}/pypi/vane-ai/0.2.0/json")
+    for response in (
+        (404, {}),
+        (200, {"urls": files[:-1]}),
+        (200, {"urls": [{**record, "yanked": True} for record in files]}),
+    ):
+        with mock.patch.object(validator, "_request_json", return_value=response):
+            require_error(ValueError, lambda: preflight.require_indexed_runtime(validator, "0.2.0", "release", config))
+
+
+def exercise_phase_boundaries(builder: ModuleType) -> None:
+    with tempfile.TemporaryDirectory(prefix="vane-paimon-phase-") as value:
+        root = Path(value)
+        native = root / "build/duckdb/extension/paimon/paimon.duckdb_extension"
+        native.parent.mkdir(parents=True)
+        native.write_bytes(b"native-data" * 128 + b"\0" * 256)
+        license_file = root / "LICENSE.txt"
+        license_file.write_text("Apache-2.0")
+        dependencies = root / "dependencies"
+        dependencies.mkdir()
+        unsigned = root / "unsigned"
+        signed = root / "signed"
+        signed.mkdir()
+        arguments = SimpleNamespace(
+            phase="prepare",
+            signing_profile="testpypi",
+            signing_private_key=None,
+            consume_signing_private_key=False,
+            package_local_runtime=False,
+            runtime_python=[],
+            runtime_wheel=[],
+            unsigned_directory=None,
+            signed_directory=None,
+            extension_root=REPOSITORY_ROOT,
+            vane_source=root,
+            vane_revision="a" * 40,
+            vane_vcpkg_installed=dependencies,
+            vcpkg_toolchain=root / "toolchain.cmake",
+            build_directory=root / "build",
+            output_directory=unsigned,
+            jobs=1,
+        )
+        builder._require_phase(arguments)
+        for overrides in (
+            {"phase": "full"},
+            {"signing_private_key": root / "secret.pem"},
+            {"consume_signing_private_key": True},
+            {"package_local_runtime": True},
+            {"runtime_python": [Path(sys.executable)]},
+            {"signing_profile": "ci-test"},
+        ):
+            invalid = SimpleNamespace(**{**vars(arguments), **overrides})
+            require_error(builder.QualificationError, lambda: builder._require_phase(invalid))
+        with (
+            mock.patch.object(builder, "_parse_arguments", return_value=arguments),
+            mock.patch.object(builder, "_require_git_revision"),
+            mock.patch.object(builder, "_platform_tag", return_value=PLATFORM),
+            mock.patch.object(builder, "_require_vcpkg_toolchain", return_value=root / "toolchain.cmake"),
+            mock.patch.object(builder, "_build_environment", return_value={}),
+            mock.patch.object(builder, "_one_wheel", return_value=root / "base.whl"),
+            mock.patch.object(builder, "_require_base_wheel_free_of_paimon"),
+            mock.patch.object(builder, "_require_self_contained_artifact") as audit,
+            mock.patch.object(builder, "_stage_license_files", return_value=(license_file,)),
+            mock.patch.object(builder, "_run") as run,
+            mock.patch.object(builder, "_read_signing_private_key") as key,
+            mock.patch.object(builder, "_package_provider_matrix") as package,
+        ):
+            if builder.main() != 0:
+                raise AssertionError("unsigned native preparation failed")
+            audit.assert_called_once_with(native)
+            key.assert_not_called()
+            package.assert_not_called()
+            if run.call_count != 2 or any("sign_test_dynamic_extension.py" in str(call) for call in run.call_args_list):
+                raise AssertionError("prepare must only perform the native build and no signing")
+        if (unsigned / "artifacts/paimon.duckdb_extension").read_bytes() != native.read_bytes():
+            raise AssertionError("prepare must preserve the native bytes")
+        if (unsigned / "licenses/paimon/LICENSE.txt").read_bytes() != license_file.read_bytes():
+            raise AssertionError("prepare must carry licenses forward without executable metadata")
+        signed_artifact = signed / native.name
+        signed_artifact.write_bytes(native.read_bytes()[:-256] + b"s" * 256)
+        builder._prepared_inputs(unsigned, signed)
+        signed_artifact.write_bytes(b"x" + signed_artifact.read_bytes()[1:])
+        require_error(builder.QualificationError, lambda: builder._prepared_inputs(unsigned, signed))
+        signed_artifact.write_bytes(native.read_bytes()[:-256] + b"s" * 256)
+        arguments = SimpleNamespace(
+            **{
+                **vars(arguments),
+                "phase": "package",
+                "unsigned_directory": unsigned,
+                "signed_directory": signed,
+                "build_directory": None,
+                "vcpkg_toolchain": None,
+                "vane_vcpkg_installed": None,
+                "runtime_python": [Path(sys.executable)],
+                "runtime_wheel": [license_file],
+                "output_directory": root / "dist",
+            }
+        )
+        with (
+            mock.patch.object(builder, "_parse_arguments", return_value=arguments),
+            mock.patch.object(builder, "_require_git_revision"),
+            mock.patch.object(builder, "_platform_tag", return_value=PLATFORM),
+            mock.patch.object(builder, "_build_environment") as environment,
+            mock.patch.object(builder, "_run") as run,
+            mock.patch.object(builder, "_read_signing_private_key") as key,
+            mock.patch.object(builder, "_package_provider_matrix") as package,
+        ):
+            if builder.main() != 0:
+                raise AssertionError("fresh wheel packaging failed")
+            package.assert_called_once()
+            if package.call_args.kwargs["signed"] != signed_artifact:
+                raise AssertionError("package did not consume the isolated signed artifact")
+            environment.assert_not_called()
+            run.assert_not_called()
+            key.assert_not_called()
+
+
+def exercise_isolated_signer(signer: ModuleType) -> None:
+    source = (REPOSITORY_ROOT / "scripts/sign_vane_dynamic_bundle.py").read_text()
+    allowed = {"__future__", "argparse", "hashlib", "os", "re", "stat", "subprocess", "tempfile", "tomllib", "pathlib"}
+    for node in ast.walk(ast.parse(source)):
+        modules = (
+            [alias.name for alias in node.names]
+            if isinstance(node, ast.Import)
+            else [node.module] if isinstance(node, ast.ImportFrom) else []
+        )
+        if any(module not in allowed for module in modules):
+            raise AssertionError("the signing boundary must remain stdlib-only")
+    for profile, filename in (("production", "vane-extension-release.toml"), ("testpypi", "vane-extension.toml")):
+        with mock.patch.object(signer, "_git", return_value=(REPOSITORY_ROOT / filename).read_text()) as git:
+            manifest = signer.committed_manifest(REPOSITORY_ROOT, profile)
+            git.assert_called_once_with(REPOSITORY_ROOT, "show", f"HEAD:{filename}")
+            if manifest["repository"] != "AstroVela/vane":
+                raise AssertionError("the signing source must stay fixed to the official repository")
+    with tempfile.TemporaryDirectory(prefix="vane-paimon-isolated-sign-") as value:
+        root = Path(value)
+        incoming = root / "unsigned/artifacts"
+        incoming.mkdir(parents=True)
+        native = incoming / "paimon.duckdb_extension"
+        native.write_bytes(b"payload" * 128 + b"\0" * 256)
+        signer.require_artifact(native)
+        link = incoming / "link.duckdb_extension"
+        link.symlink_to(native)
+        require_error(ValueError, lambda: signer.require_artifact(link))
+        with mock.patch.object(signer, "MAX_ARTIFACT_BYTES", 512):
+            require_error(ValueError, lambda: signer.require_artifact(native))
+        native.write_bytes(native.read_bytes()[:-256] + b"s" * 256)
+        require_error(ValueError, lambda: signer.require_artifact(native))
+        native.write_bytes(native.read_bytes()[:-256] + b"\0" * 256)
+        temporary = root / "runner-temp"
+        temporary.mkdir()
+        arguments = SimpleNamespace(
+            extension_root=REPOSITORY_ROOT,
+            profile="production",
+            vane_source=root / "vane",
+            input_directory=root / "unsigned",
+            output_directory=root / "signed",
+        )
+        observed_keys = []
+
+        def fake_git(_root, *args):
+            return (
+                "a" * 40
+                if args[0] == "rev-parse"
+                else "https://github.com/AstroVela/vane" if args[0] == "remote" else ""
+            )
+
+        def failed_sign(command, **kwargs):
+            if command[:3] != ["/usr/bin/python3", "-I", "-S"]:
+                raise AssertionError("signer utility must run without site packages")
+            if "VANE_PROVIDER_SIGNING_PRIVATE_KEY" in kwargs["env"]:
+                raise AssertionError("the private key must not reach child process environments")
+            key_path = Path(command[command.index("--private-key") + 1])
+            if key_path.stat().st_mode & 0o777 != 0o600 or key_path.read_bytes() != b"throwaway test key":
+                raise AssertionError("the signer must use a private bounded temporary key")
+            observed_keys.append(key_path)
+            raise RuntimeError("synthetic signer failure")
+
+        with (
+            mock.patch.dict(
+                os.environ, {"RUNNER_TEMP": str(temporary), "VANE_PROVIDER_SIGNING_PRIVATE_KEY": "throwaway test key"}
+            ),
+            mock.patch.object(signer, "committed_manifest", return_value={"revision": "a" * 40}),
+            mock.patch.object(signer, "_git", side_effect=fake_git),
+            mock.patch.object(signer, "require_key_fingerprint"),
+            mock.patch.object(signer.subprocess, "run", side_effect=failed_sign),
+        ):
+            require_error(
+                RuntimeError,
+                lambda: signer.main(
+                    [
+                        "sign",
+                        "--profile",
+                        "production",
+                        "--extension-root",
+                        str(REPOSITORY_ROOT),
+                        "--vane-source",
+                        str(arguments.vane_source),
+                        "--input-directory",
+                        str(arguments.input_directory),
+                        "--output-directory",
+                        str(arguments.output_directory),
+                    ]
+                ),
+            )
+            if "VANE_PROVIDER_SIGNING_PRIVATE_KEY" in os.environ:
+                raise AssertionError("the secret must be removed before any subprocess")
+        if not observed_keys or any(path.exists() for path in observed_keys) or any(temporary.iterdir()):
+            raise AssertionError("private signing files must be removed after failure")
 
 
 def exercise_private_key_consumption(builder: ModuleType) -> None:
@@ -498,18 +786,23 @@ def main() -> None:
         "scripts/build_vane_dynamic_wheel.py",
     )
     preflight = load_script("vane_paimon_release_preflight", "scripts/vane_release_preflight.py")
+    signer = load_script("vane_paimon_isolated_signer", "scripts/sign_vane_dynamic_bundle.py")
     try:
         exercise_release_validator(validator)
         exercise_integration_pins()
         exercise_promotion_cli(validator)
         exercise_workflow_contract()
         exercise_preflight(preflight, validator)
-        exercise_production_signing(builder)
+        exercise_production_signing(builder, signer)
+        exercise_runtime_index(preflight, validator)
+        exercise_phase_boundaries(builder)
+        exercise_isolated_signer(signer)
         exercise_private_key_consumption(builder)
     finally:
         sys.modules.pop(validator.__name__, None)
         sys.modules.pop(builder.__name__, None)
         sys.modules.pop(preflight.__name__, None)
+        sys.modules.pop(signer.__name__, None)
 
 
 if __name__ == "__main__":
