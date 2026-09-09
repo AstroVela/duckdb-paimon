@@ -6,34 +6,35 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Run CI only or publish the pinned Paimon provider candidate to TestPyPI
+        description: Build only, publish development wheels to TestPyPI, or qualify and promote a production release
         type: choice
         options:
           - build-only
           - testpypi-dev
+          - release
         default: build-only
         required: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ inputs.operation || 'ci' }}
-  cancel-in-progress: ${{ inputs.operation != 'testpypi-dev' }}
+  cancel-in-progress: ${{ inputs.operation != 'testpypi-dev' && inputs.operation != 'release' }}
 
 permissions:
   contents: read
 
 jobs:
   vane-extension:
-    if: inputs.operation != 'testpypi-dev'
+    if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
     # The called workflow verifies its exact SHA from GitHub job metadata.
-    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@671717e4816c21e65aa32a32dd0def8b030baa44
+    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@618aec05ad68c8c130c69505b1fd99311fc9f47d
     with:
-      ci_tools_version: 671717e4816c21e65aa32a32dd0def8b030baa44
+      ci_tools_version: 618aec05ad68c8c130c69505b1fd99311fc9f47d
       manifest: vane-extension.toml
       build_jobs: 12
       run_native_tests: true
 
   vane-provider-release-tooling:
-    if: inputs.operation != 'testpypi-dev'
+    if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
     name: Validate Paimon provider release tooling
     runs-on: ubuntu-24.04
     permissions:
@@ -55,13 +56,13 @@ jobs:
           python-version: "3.12"
 
       - name: Install release validation tooling
-        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
+        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt "PyYAML>=6.0.2"
 
       - name: Exercise release validation and secure key consumption
         run: python -I test/vane/test_vane_provider_release.py
 
   vane-dynamic-wheel:
-    if: inputs.operation != 'testpypi-dev'
+    if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
     name: Build signed Vane dynamic Paimon wheel
     runs-on: ubuntu-24.04
     container:
@@ -124,7 +125,7 @@ jobs:
       - name: Validate exact Vane and CI-tools identities
         shell: bash
         env:
-          VANE_CI_TOOLS_VERSION: 671717e4816c21e65aa32a32dd0def8b030baa44
+          VANE_CI_TOOLS_VERSION: 618aec05ad68c8c130c69505b1fd99311fc9f47d
         run: |
           set -euo pipefail
           actual_ci_tools="$(git -C extension/vane-extension-ci-tools rev-parse HEAD)"
@@ -267,6 +268,7 @@ jobs:
           VCPKG_MAX_CONCURRENCY: ${{ env.VANE_BUILD_JOBS }}
         run: |
           python -I extension/scripts/build_vane_dynamic_wheel.py \
+            --phase full \
             --extension-root "$VANE_EXTENSION_ROOT" \
             --vane-source "$VANE_SOURCE_DIR" \
             --vane-revision "${{ steps.manifest.outputs.vane_revision }}" \
@@ -298,7 +300,7 @@ jobs:
           retention-days: 1
 
   vane-wheel-paimon-integration:
-    if: inputs.operation != 'testpypi-dev'
+    if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
     name: Vane dynamic wheel local Paimon integration
     needs: vane-dynamic-wheel
     runs-on: ubuntu-24.04
@@ -317,8 +319,9 @@ jobs:
           persist-credentials: false
 
       - name: Download verified dynamic wheels
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          digest-mismatch: error
           name: vane-paimon-dynamic-wheels
           path: vane-wheels
 
@@ -342,7 +345,7 @@ jobs:
           python -I test/vane/test_vane_wheel_paimon.py
 
   vane-wheel-ray-paimon-integration:
-    if: inputs.operation != 'testpypi-dev'
+    if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
     name: Vane dynamic wheel two-worker Ray Paimon integration
     needs: vane-dynamic-wheel
     runs-on: ubuntu-24.04
@@ -363,8 +366,9 @@ jobs:
           persist-credentials: false
 
       - name: Download verified dynamic wheels
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          digest-mismatch: error
           name: vane-paimon-dynamic-wheels
           path: vane-wheels
 
@@ -387,28 +391,88 @@ jobs:
             "${base_wheels[0]}" "${paimon_wheels[0]}"
           python -I test/vane/test_vane_wheel_ray_paimon.py
 
-  vane-testpypi-wheels:
-    if: inputs.operation == 'testpypi-dev'
-    name: Build signed TestPyPI Paimon provider wheels
+  vane-release-preflight:
+    name: Validate the publishing context and exact Vane release
+    if: inputs.operation == 'testpypi-dev' || inputs.operation == 'release'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      vane_version: ${{ steps.preflight.outputs.vane_version }}
+    env:
+      VANE_RELEASE_MANIFEST: ${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
+    steps:
+      - name: Require the protected publishing branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REPOSITORY" = AstroVela/duckdb-paimon
+          test "$GITHUB_REF" = refs/heads/main_vane
+          test "$GITHUB_REF_PROTECTED" = true
+
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Initialize exact shared release tooling
+        run: git submodule update --init vane-extension-ci-tools
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install preflight tooling
+        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt "setuptools-scm>=9.2.0"
+
+      - name: Read the committed Vane source pin
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_RELEASE_MANIFEST" --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source and version history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Reject an unavailable production release before signing or building
+        id: preflight
+        env:
+          RELEASE_OPERATION: ${{ inputs.operation }}
+        run: |
+          python -I scripts/vane_release_preflight.py \
+            --operation "$RELEASE_OPERATION" \
+            --vane-source "$GITHUB_WORKSPACE/vane" \
+            --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --github-output "$GITHUB_OUTPUT"
+
+  vane-testpypi-prepare:
+    needs: vane-release-preflight
+    if: inputs.operation == 'testpypi-dev' || inputs.operation == 'release'
+    name: Build unsigned Paimon native data once
     runs-on: ubuntu-24.04
     timeout-minutes: 240
-    environment:
-      name: testpypi
-      url: https://test.pypi.org/p/vane-extension-paimon
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64@sha256:0bf9db09181f36be8cf0628332abb5d31855b7d0f372faa776f492ccd9d3100d
     permissions:
       contents: read
     outputs:
-      vane_version: ${{ steps.release.outputs.vane_version }}
-      paimon_version: ${{ steps.release.outputs.paimon_version }}
+      artifact_id: ${{ steps.unsigned.outputs.artifact-id }}
     env:
       VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
-      VANE_MANIFEST: ${{ github.workspace }}/extension/vane-extension.toml
+      VANE_MANIFEST: ${{ github.workspace }}/extension/${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
       VANE_SOURCE_DIR: ${{ github.workspace }}/vane
       VANE_DYNAMIC_BUILD_DIR: ${{ github.workspace }}/build/vane-testpypi-wheel
       VANE_DYNAMIC_DIST_DIR: ${{ github.workspace }}/build/vane-testpypi-wheel-dist
-      VANE_RUNTIME_WHEEL_DIR: ${{ github.workspace }}/build/vane-testpypi-runtime-wheels
       VANE_VCPKG_ROOT: ${{ github.workspace }}/vane-vcpkg
       VANE_VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vane/vcpkg_installed
       VANE_PYTHON: /opt/python/cp312-cp312/bin/python
@@ -427,6 +491,8 @@ jobs:
           set -euo pipefail
           test "$GITHUB_EVENT_NAME" = workflow_dispatch
           test "$GITHUB_REF" = refs/heads/main_vane
+          test "$GITHUB_REPOSITORY" = AstroVela/duckdb-paimon
+          test "$GITHUB_REF_PROTECTED" = true
 
       - name: Checkout extension and submodules
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -532,7 +598,7 @@ jobs:
       - name: Validate exact Vane and CI-tools identities
         shell: bash
         env:
-          VANE_CI_TOOLS_VERSION: 671717e4816c21e65aa32a32dd0def8b030baa44
+          VANE_CI_TOOLS_VERSION: 618aec05ad68c8c130c69505b1fd99311fc9f47d
         run: |
           set -euo pipefail
           actual_ci_tools="$(git -C extension/vane-extension-ci-tools rev-parse HEAD)"
@@ -602,25 +668,184 @@ jobs:
             VANE_BUILD_JOBS="$VANE_BUILD_JOBS" \
             VANE_PYTHON="$VANE_PYTHON"
 
+      - name: Build unsigned Paimon native data and licenses
+        shell: bash
+        env:
+          VANE_SIGNING_PROFILE: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
+          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+          VCPKG_MAX_CONCURRENCY: ${{ env.VANE_BUILD_JOBS }}
+        run: |
+          set -euo pipefail
+          "$VANE_PYTHON" -I extension/scripts/build_vane_dynamic_wheel.py \
+            --phase prepare \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            --vane-source "$VANE_SOURCE_DIR" \
+            --vane-revision "${{ steps.manifest.outputs.vane_revision }}" \
+            --vane-vcpkg-installed "$VANE_VCPKG_INSTALLED_DIR" \
+            --vcpkg-toolchain "$VCPKG_TOOLCHAIN_PATH" \
+            --build-directory "$VANE_DYNAMIC_BUILD_DIR" \
+            --output-directory "$VANE_DYNAMIC_DIST_DIR" \
+            --jobs "$VANE_BUILD_JOBS" \
+            --signing-profile "$VANE_SIGNING_PROFILE"
+
+      - name: Report compiler cache
+        if: always()
+        shell: bash
+        env:
+          VANE_CACHE_ACTION_HIT: ${{ steps.testpypi_cache.outputs.cache-hit }}
+        run: |
+          printf 'GitHub Actions cache restore hit: %s\n' "${VANE_CACHE_ACTION_HIT:-false}"
+          ccache --show-stats
+
+      - name: Upload unsigned Paimon data and license bundle
+        id: unsigned
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-testpypi-paimon-unsigned
+          path: ${{ env.VANE_DYNAMIC_DIST_DIR }}
+          if-no-files-found: error
+          retention-days: 30
+
+  vane-testpypi-sign:
+    name: Sign Paimon native data in isolation
+    needs: vane-testpypi-prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: ${{ inputs.operation == 'release' && 'production-signing' || 'testpypi' }}
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.signed.outputs.artifact-id }}
+    env:
+      VANE_SIGNING_PROFILE: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
+
+    steps:
+      - name: Checkout reviewed signing wrapper and manifests
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: extension
+          persist-credentials: false
+
+      - name: Read the committed exact official Vane signing source
+        id: manifest
+        run: |
+          /usr/bin/python3 -I -S extension/scripts/sign_vane_dynamic_bundle.py manifest \
+            --profile "$VANE_SIGNING_PROFILE" --extension-root extension \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout the committed Vane signing utility
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: AstroVela/vane
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          persist-credentials: false
+
+      - name: Download the original unsigned native data
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.vane-testpypi-prepare.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: unsigned
+
+      - name: Sign fixed native data without installing or executing dependencies
+        env:
+          VANE_PROVIDER_SIGNING_PRIVATE_KEY: ${{ secrets[inputs.operation == 'release' && 'VANE_EXTENSION_SIGNING_PRIVATE_KEY' || 'VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY'] }}
+        run: |
+          /usr/bin/python3 -I -S extension/scripts/sign_vane_dynamic_bundle.py sign \
+            --profile "$VANE_SIGNING_PROFILE" --extension-root extension \
+            --vane-source vane --input-directory unsigned --output-directory signed
+
+      - name: Upload only the signed native artifact
+        id: signed
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-testpypi-paimon-signed
+          path: signed/paimon.duckdb_extension
+          if-no-files-found: error
+          retention-days: 30
+
+  vane-testpypi-wheels:
+    name: Package and verify Paimon candidates without signing authority
+    needs: [vane-release-preflight, vane-testpypi-prepare, vane-testpypi-sign]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:0bf9db09181f36be8cf0628332abb5d31855b7d0f372faa776f492ccd9d3100d
+    permissions:
+      contents: read
+    outputs:
+      vane_version: ${{ steps.release.outputs.vane_version }}
+      paimon_version: ${{ steps.release.outputs.paimon_version }}
+      artifact_id: ${{ steps.wheels.outputs.artifact-id }}
+    env:
+      VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
+      VANE_MANIFEST: ${{ github.workspace }}/extension/${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
+      VANE_SOURCE_DIR: ${{ github.workspace }}/vane
+      VANE_PYTHON: /opt/python/cp312-cp312/bin/python
+      VANE_DYNAMIC_DIST_DIR: ${{ github.workspace }}/dist
+      VANE_RUNTIME_WHEEL_DIR: ${{ github.workspace }}/runtime-wheels
+
+    steps:
+      - name: Checkout reviewed packaging and validation tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: extension
+          persist-credentials: false
+
+      - name: Initialize exact shared release tooling
+        run: git -C extension submodule update --init vane-extension-ci-tools
+
+      - name: Install wheel packaging tooling without signing authority
+        run: |
+          "$VANE_PYTHON" -m pip install --disable-pip-version-check \
+            "auditwheel>=6.4" -r extension/vane-extension-ci-tools/requirements-release.txt
+
+      - name: Read selected integration manifest
+        id: manifest
+        run: |
+          "$VANE_PYTHON" extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane packaging and verification source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          persist-credentials: false
+
+      - name: Download original unsigned native and license data
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.vane-testpypi-prepare.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: unsigned
+
+      - name: Download original signed native data
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.vane-testpypi-sign.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: signed
+
       - name: Download every exact indexed Vane runtime wheel
         id: vane_candidate
         shell: bash
         env:
-          INDEX_URL: https://test.pypi.org/simple/
+          INDEX_URL: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
+          VANE_VERSION: ${{ needs.vane-release-preflight.outputs.vane_version }}
         run: |
           set -euo pipefail
-          version="$(cd "$VANE_SOURCE_DIR" && "$VANE_PYTHON" -m setuptools_scm)"
-          "$VANE_PYTHON" - "$version" <<'PY'
-          import sys
-          from packaging.version import Version
-
-          raw = sys.argv[1]
-          version = Version(raw)
-          if str(version) != raw or not version.is_devrelease or version.local is not None:
-              raise SystemExit(
-                  f"Vane source did not resolve to a canonical public development version: {raw!r}"
-              )
-          PY
+          # An explicit --index-url must not be supplemented by runner pip configuration.
+          for pip_variable in "${!PIP_@}"; do unset "$pip_variable"; done
+          export PIP_CONFIG_FILE=/dev/null
+          version="$VANE_VERSION"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           mkdir -p "$VANE_RUNTIME_WHEEL_DIR"
           for runtime in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do
@@ -638,24 +863,12 @@ jobs:
             test "$(find "$destination" -maxdepth 1 -type f -name 'vane_ai-*.whl' | wc -l)" -eq 1
           done
 
-      - name: Build, sign and verify the Paimon provider wheel matrix
+      - name: Package and verify the signed provider matrix without rebuilding
         shell: bash
         env:
-          VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY: ${{ secrets.VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY }}
-          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
-          VCPKG_MAX_CONCURRENCY: ${{ env.VANE_BUILD_JOBS }}
+          VANE_SIGNING_PROFILE: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
         run: |
           set -euo pipefail
-          test -n "$VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY"
-          signing_key="$RUNNER_TEMP/vane-testpypi-extension-signing.pem"
-          cleanup() {
-            shred --force --remove "$signing_key" 2>/dev/null || true
-          }
-          trap cleanup EXIT
-          umask 077
-          printf '%s' "$VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY" > "$signing_key"
-          unset VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY
-
           runtime_arguments=()
           for runtime in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do
             interpreter="/opt/python/$runtime/bin/python"
@@ -663,25 +876,26 @@ jobs:
             test "${#wheels[@]}" -eq 1
             runtime_arguments+=(--runtime-python "$interpreter" --runtime-wheel "${wheels[0]}")
           done
-
           "$VANE_PYTHON" -I extension/scripts/build_vane_dynamic_wheel.py \
-            --extension-root "$VANE_EXTENSION_ROOT" \
+            --phase package --extension-root "$VANE_EXTENSION_ROOT" \
             --vane-source "$VANE_SOURCE_DIR" \
             --vane-revision "${{ steps.manifest.outputs.vane_revision }}" \
-            --vane-vcpkg-installed "$VANE_VCPKG_INSTALLED_DIR" \
-            --vcpkg-toolchain "$VCPKG_TOOLCHAIN_PATH" \
-            --build-directory "$VANE_DYNAMIC_BUILD_DIR" \
+            --unsigned-directory unsigned --signed-directory signed \
             --output-directory "$VANE_DYNAMIC_DIST_DIR" \
-            --jobs "$VANE_BUILD_JOBS" \
-            --signing-profile testpypi \
-            --signing-private-key "$signing_key" \
-            --consume-signing-private-key \
+            --signing-profile "$VANE_SIGNING_PROFILE" \
             "${runtime_arguments[@]}"
 
       - name: Validate the immutable publishable release set
         id: release
         shell: bash
+        env:
+          RELEASE_OPERATION: ${{ inputs.operation }}
         run: |
+          set -euo pipefail
+          publish_arguments=(--require-publishable-on testpypi)
+          if test "$RELEASE_OPERATION" = release; then
+            publish_arguments+=(--require-publishable-on pypi)
+          fi
           "$VANE_PYTHON" -I extension/vane-extension-ci-tools/scripts/vane_provider_release.py validate \
             --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
             --vane-source "$VANE_SOURCE_DIR" \
@@ -689,19 +903,12 @@ jobs:
             --config extension/vane-provider-release.toml \
             --directory "$VANE_DYNAMIC_DIST_DIR" \
             --vane-version "${{ steps.vane_candidate.outputs.version }}" \
-            --require-testpypi-publishable \
+            --channel "$RELEASE_OPERATION" \
+            "${publish_arguments[@]}" \
             --github-output "$GITHUB_OUTPUT"
 
-      - name: Report compiler cache
-        if: always()
-        shell: bash
-        env:
-          VANE_CACHE_ACTION_HIT: ${{ steps.testpypi_cache.outputs.cache-hit }}
-        run: |
-          printf 'GitHub Actions cache restore hit: %s\n' "${VANE_CACHE_ACTION_HIT:-false}"
-          ccache --show-stats
-
       - name: Upload verified Paimon provider wheels
+        id: wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vane-testpypi-paimon-wheels
@@ -717,9 +924,13 @@ jobs:
       attestations: write
       contents: read
       id-token: write
+    env:
+      VANE_RELEASE_MANIFEST: ${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
+      RELEASE_OPERATION: ${{ inputs.operation }}
     outputs:
       vane_version: ${{ needs.vane-testpypi-wheels.outputs.vane_version }}
       paimon_version: ${{ needs.vane-testpypi-wheels.outputs.paimon_version }}
+      artifact_id: ${{ steps.distributions.outputs.artifact-id }}
 
     steps:
       - name: Checkout release tooling
@@ -743,7 +954,7 @@ jobs:
         id: manifest
         run: |
           python -I vane-extension-ci-tools/scripts/vane_extension.py \
-            --manifest vane-extension.toml --extension-root . \
+            --manifest "$VANE_RELEASE_MANIFEST" --extension-root . \
             manifest --github-output "$GITHUB_OUTPUT"
 
       - name: Checkout exact Vane source for release verification
@@ -756,21 +967,29 @@ jobs:
           persist-credentials: false
 
       - name: Download Paimon provider wheels
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: vane-testpypi-paimon-wheels
+          digest-mismatch: error
+          artifact-ids: ${{ needs.vane-testpypi-wheels.outputs.artifact_id }}
+          merge-multiple: true
           path: packages
 
       - name: Revalidate the complete release set
         run: |
+          set -euo pipefail
+          publish_arguments=(--require-publishable-on testpypi)
+          if test "$RELEASE_OPERATION" = release; then
+            publish_arguments+=(--require-publishable-on pypi)
+          fi
           python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
-            --manifest vane-extension.toml --extension-root . \
+            --manifest "$VANE_RELEASE_MANIFEST" --extension-root . \
             --vane-source vane \
             --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
             --config vane-provider-release.toml \
             --directory packages \
             --vane-version "${{ needs.vane-testpypi-wheels.outputs.vane_version }}" \
-            --require-testpypi-publishable
+            --channel "$RELEASE_OPERATION" \
+            "${publish_arguments[@]}"
 
       - name: Assemble distributions and checksums
         run: |
@@ -803,6 +1022,7 @@ jobs:
           inputs: packages/*.whl
 
       - name: Upload Paimon distributions
+        id: distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vane-testpypi-paimon-distributions
@@ -833,9 +1053,11 @@ jobs:
 
     steps:
       - name: Download Paimon distributions
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: vane-testpypi-paimon-distributions
+          digest-mismatch: error
+          artifact-ids: ${{ needs.assemble-testpypi-paimon.outputs.artifact_id }}
+          merge-multiple: true
           path: dist
 
       - name: Publish through trusted publishing
@@ -850,6 +1072,8 @@ jobs:
     name: Verify indexed Paimon provider
     needs: [assemble-testpypi-paimon, publish-testpypi-paimon]
     runs-on: ubuntu-24.04
+    env:
+      VANE_RELEASE_MANIFEST: ${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
     permissions:
       contents: read
 
@@ -875,7 +1099,7 @@ jobs:
         id: manifest
         run: |
           python -I vane-extension-ci-tools/scripts/vane_extension.py \
-            --manifest vane-extension.toml --extension-root . \
+            --manifest "$VANE_RELEASE_MANIFEST" --extension-root . \
             manifest --github-output "$GITHUB_OUTPUT"
 
       - name: Checkout exact Vane source for release verification
@@ -888,15 +1112,18 @@ jobs:
           persist-credentials: false
 
       - name: Download Paimon distributions
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: vane-testpypi-paimon-distributions
+          digest-mismatch: error
+          artifact-ids: ${{ needs.assemble-testpypi-paimon.outputs.artifact_id }}
+          merge-multiple: true
           path: dist
 
       - name: Compare the immutable indexed release
         run: |
           python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-index \
-            --manifest vane-extension.toml --extension-root . \
+            --index testpypi \
+            --manifest "$VANE_RELEASE_MANIFEST" --extension-root . \
             --vane-source vane \
             --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
             --config vane-provider-release.toml \
@@ -913,8 +1140,9 @@ jobs:
       contents: read
     env:
       VANE_RUNNER: local-fast
-      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: astrovela/vane-testpypi
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.operation == 'release' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
       INDEX_URL: https://test.pypi.org/simple/
+      RUNTIME_INDEX_URL: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
 
     steps:
       - name: Checkout extension tests
@@ -924,9 +1152,11 @@ jobs:
           persist-credentials: false
 
       - name: Download expected Paimon distributions
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: vane-testpypi-paimon-distributions
+          digest-mismatch: error
+          artifact-ids: ${{ needs.assemble-testpypi-paimon.outputs.artifact_id }}
+          merge-multiple: true
           path: expected/paimon
 
       - name: Set up Python
@@ -941,19 +1171,23 @@ jobs:
           PAIMON_VERSION: ${{ needs.assemble-testpypi-paimon.outputs.paimon_version }}
         run: |
           set -euo pipefail
+          # An explicit --index-url must not be supplemented by runner pip configuration.
+          for pip_variable in "${!PIP_@}"; do unset "$pip_variable"; done
+          export PIP_CONFIG_FILE=/dev/null
           python -m venv .venv-vane-testpypi-local
           . .venv-vane-testpypi-local/bin/activate
           python -m pip install --upgrade pip
           mkdir -p indexed
           download_exact() {
             local requirement="$1"
+            local index_url="$2"
             for attempt in 1 2 3 4 5; do
               if python -m pip download \
                 --disable-pip-version-check \
                 --no-cache-dir \
                 --no-deps \
                 --only-binary=:all: \
-                --index-url "$INDEX_URL" \
+                --index-url "$index_url" \
                 --dest indexed \
                 "$requirement"; then
                 return
@@ -962,8 +1196,8 @@ jobs:
             done
             return 1
           }
-          download_exact "vane-ai==$VANE_VERSION"
-          download_exact "vane-extension-paimon==$PAIMON_VERSION"
+          download_exact "vane-ai==$VANE_VERSION" "$RUNTIME_INDEX_URL"
+          download_exact "vane-extension-paimon==$PAIMON_VERSION" "$INDEX_URL"
 
           mapfile -t base_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
           mapfile -t paimon_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_extension_paimon-*.whl' -print)
@@ -987,10 +1221,11 @@ jobs:
       contents: read
     env:
       VANE_RUNNER: ray
-      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: astrovela/vane-testpypi
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.operation == 'release' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
       VANE_UDF_TARGET_MAX_BATCH_BYTES: "4096"
       RAY_DEDUP_LOGS: "0"
       INDEX_URL: https://test.pypi.org/simple/
+      RUNTIME_INDEX_URL: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
 
     steps:
       - name: Checkout extension tests
@@ -998,6 +1233,14 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Download expected Paimon distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.assemble-testpypi-paimon.outputs.artifact_id }}
+          merge-multiple: true
+          path: expected/paimon
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -1011,19 +1254,23 @@ jobs:
           PAIMON_VERSION: ${{ needs.assemble-testpypi-paimon.outputs.paimon_version }}
         run: |
           set -euo pipefail
+          # An explicit --index-url must not be supplemented by runner pip configuration.
+          for pip_variable in "${!PIP_@}"; do unset "$pip_variable"; done
+          export PIP_CONFIG_FILE=/dev/null
           python -m venv .venv-vane-testpypi-ray
           . .venv-vane-testpypi-ray/bin/activate
           python -m pip install --upgrade pip
           mkdir -p indexed
           download_exact() {
             local requirement="$1"
+            local index_url="$2"
             for attempt in 1 2 3 4 5; do
               if python -m pip download \
                 --disable-pip-version-check \
                 --no-cache-dir \
                 --no-deps \
                 --only-binary=:all: \
-                --index-url "$INDEX_URL" \
+                --index-url "$index_url" \
                 --dest indexed \
                 "$requirement"; then
                 return
@@ -1032,15 +1279,177 @@ jobs:
             done
             return 1
           }
-          download_exact "vane-ai==$VANE_VERSION"
-          download_exact "vane-extension-paimon==$PAIMON_VERSION"
+          download_exact "vane-ai==$VANE_VERSION" "$RUNTIME_INDEX_URL"
+          download_exact "vane-extension-paimon==$PAIMON_VERSION" "$INDEX_URL"
 
           mapfile -t base_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
           mapfile -t paimon_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_extension_paimon-*.whl' -print)
+          mapfile -t expected_paimon < <(find expected/paimon -maxdepth 1 -type f -name '*-cp312-none-manylinux_2_28_x86_64.whl' -print)
           test "${#base_wheels[@]}" -eq 1
           test "${#paimon_wheels[@]}" -eq 1
+          test "${#expected_paimon[@]}" -eq 1
+          cmp "${expected_paimon[0]}" "${paimon_wheels[0]}"
           python -m pip install "${base_wheels[0]}" "${paimon_wheels[0]}"
           python -m pip check
 
       - name: Exercise the indexed provider through two Ray workers
         run: .venv-vane-testpypi-ray/bin/python -I test/vane/test_vane_wheel_ray_paimon.py
+
+  verify-pypi-promotion:
+    name: Approve and verify immutable Paimon promotion
+    if: inputs.operation == 'release'
+    needs:
+      - assemble-testpypi-paimon
+      - testpypi-local-paimon-integration
+      - testpypi-ray-paimon-integration
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/vane-extension-paimon
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Initialize exact shared release tooling
+        run: git submodule update --init vane-extension-ci-tools
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Read the production Vane source pin
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension-release.toml --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source for promotion verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download the unchanged qualified Paimon distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.assemble-testpypi-paimon.outputs.artifact_id }}
+          merge-multiple: true
+          path: dist
+
+      - name: Recheck immutable TestPyPI staging and PyPI availability after approval
+        env:
+          VANE_VERSION: ${{ needs.assemble-testpypi-paimon.outputs.vane_version }}
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-promotion \
+            --manifest vane-extension-release.toml --extension-root . \
+            --vane-source vane \
+            --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml --directory dist \
+            --vane-version "$VANE_VERSION"
+
+  publish-pypi-paimon:
+    name: Publish the approved immutable Paimon candidate to PyPI
+    if: inputs.operation == 'release'
+    needs: [verify-pypi-promotion, assemble-testpypi-paimon]
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/vane-extension-paimon
+    permissions:
+      contents: read
+      id-token: write
+
+    # Never install or execute release-tool dependencies with publishing OIDC.
+    # The artifact is the original tested distribution, not verifier-produced files.
+    steps:
+      - name: Download the unchanged qualified Paimon distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.assemble-testpypi-paimon.outputs.artifact_id }}
+          merge-multiple: true
+          path: dist
+
+      - name: Publish the same files through trusted publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          attestations: true
+          packages-dir: dist
+          skip-existing: true
+
+  verify-pypi-paimon:
+    name: Verify the complete indexed PyPI Paimon release
+    if: inputs.operation == 'release'
+    needs: [assemble-testpypi-paimon, publish-pypi-paimon]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Initialize exact shared release tooling
+        run: git submodule update --init vane-extension-ci-tools
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Read the production Vane source pin
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension-release.toml --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source for promotion verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download the unchanged qualified Paimon distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          digest-mismatch: error
+          artifact-ids: ${{ needs.assemble-testpypi-paimon.outputs.artifact_id }}
+          merge-multiple: true
+          path: dist
+
+      - name: Verify the complete indexed PyPI release
+        env:
+          PAIMON_VERSION: ${{ needs.assemble-testpypi-paimon.outputs.paimon_version }}
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-index \
+            --index pypi \
+            --manifest vane-extension-release.toml --extension-root . \
+            --vane-source vane \
+            --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml --directory dist \
+            --provider paimon --version "$PAIMON_VERSION"
