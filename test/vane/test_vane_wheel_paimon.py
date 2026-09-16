@@ -34,7 +34,6 @@ try:
     from test_vane_wheel_ray_paimon import (
         RayPaimonHarness,
         create_two_worker_cluster,
-        require_error,
     )
 finally:
     sys.path.pop(0)
@@ -52,8 +51,8 @@ def sql_string(value: object) -> str:
 def exercise_default_ray_insert(connection: object) -> None:
     with tempfile.TemporaryDirectory(prefix="vane-paimon-smoke-insert-") as warehouse_text:
         warehouse = Path(warehouse_text).resolve()
-        uuidless_target = warehouse / "legacy.db/uuidless_target"
-        shutil.copytree(TABLE_PATH, uuidless_target)
+        fixture_target = warehouse / "legacy.db/fixture_target"
+        shutil.copytree(TABLE_PATH, fixture_target)
         connection.execute(f"ATTACH {sql_string(warehouse)} AS pm (TYPE paimon)")
         connection.execute("CREATE SCHEMA pm.smoke")
         connection.execute(
@@ -70,18 +69,15 @@ def exercise_default_ray_insert(connection: object) -> None:
             properties={"partition.default-name": "smoke-null"},
             partition_by=["part"],
         )
+        rows = [(i, i % 3, f"smoke-{i}") for i in range(12)]
         require_equal(
-            connection.execute(
-                "SELECT count(*)::BIGINT, sum(id)::BIGINT, count(DISTINCT part)::BIGINT " "FROM pm.smoke.target"
-            ).fetchone(),
-            (13, 78, 3),
+            connection.execute("SELECT id, part, payload FROM pm.smoke.target ORDER BY id").fetchall(),
+            rows + [(12, None, "smoke-partial")],
             "default Ray Paimon INSERT",
         )
         require_equal(
-            connection.execute(
-                "SELECT count(*)::BIGINT, sum(id)::BIGINT, count(DISTINCT part)::BIGINT " "FROM pm.smoke.ctas_target"
-            ).fetchone(),
-            (12, 66, 3),
+            connection.execute("SELECT id, part, payload FROM pm.smoke.ctas_target ORDER BY id").fetchall(),
+            rows,
             "default Ray Paimon CTAS",
         )
         require_equal(
@@ -89,17 +85,13 @@ def exercise_default_ray_insert(connection: object) -> None:
             (12, None, "smoke-partial"),
             "default Ray partial-column Paimon INSERT",
         )
-        require_error(
-            "UUID-less Paimon target is rejected before a distributed commit",
-            lambda: connection.execute("INSERT INTO pm.legacy.uuidless_target VALUES ('rejected', 9, 90, 99.5)"),
-            "empty table UUID",
-        )
+        connection.execute("INSERT INTO pm.legacy.fixture_target VALUES ('appended', 9, 90, 99.5)")
         require_equal(
             connection.execute(
-                "SELECT count(*)::BIGINT, max(f1), max(f2), max(f3) " "FROM pm.legacy.uuidless_target"
+                "SELECT count(*)::BIGINT, max(f1), max(f2), max(f3) " "FROM pm.legacy.fixture_target"
             ).fetchone(),
-            (9, 3, 2, 33.2),
-            "UUID-less Paimon table is unchanged",
+            (10, 9, 90, 99.5),
+            "default Ray INSERT into the copied Paimon fixture",
         )
 
 

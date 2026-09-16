@@ -276,14 +276,20 @@ class RayPaimonHarness:
     def capture_write_plan(self, operation: Callable[[], object]) -> object:
         captured: list[object] = []
 
-        def capture(logical_plan: object) -> dict[str, object]:
+        class PlanCaptured(Exception):
+            pass
+
+        def capture(logical_plan: object) -> None:
             require_true(isinstance(logical_plan, self.vane.ray_cxx.PyLogicalPlan), "captured bound write plan")
             captured.append(logical_plan)
-            return {}
+            raise PlanCaptured
 
         self.runner.run_write = capture
         try:
-            operation()
+            try:
+                operation()
+            except PlanCaptured:
+                pass
         finally:
             self.runner.run_write = self._record_distributed_write
         require_equal(len(captured), 1, "captured distributed Paimon write plan count")
@@ -1036,6 +1042,8 @@ def run_blocked_distributed_insert(
     target: str,
     description: str,
     mutation: Callable[[], None],
+    *,
+    expected_writes: int = 1,
 ) -> list[BaseException]:
     marker = uuid.uuid4().hex
     started_path = target_path.parent.parent / f".vane-paimon-{marker}-started"
@@ -1098,7 +1106,7 @@ def run_blocked_distributed_insert(
         raise AssertionError(f"distributed Paimon {description} write did not stop")
     if coordination_error is not None:
         raise coordination_error
-    require_equal(harness.write_dispatch_count, previous_count + 1, f"{description} Ray dispatch")
+    require_equal(harness.write_dispatch_count, previous_count + expected_writes, f"{description} Ray dispatch")
     return errors
 
 
@@ -1206,6 +1214,8 @@ def exercise_target_conflict_and_retry(
     multi_path: Path,
     target_path: Path,
 ) -> None:
+    committed_artifacts: list[Path] = []
+
     def commit_conflicting_snapshot() -> None:
         mutation_connection = harness.vane.connect(
             ":memory:",
@@ -1221,6 +1231,8 @@ def exercise_target_conflict_and_retry(
             mutation_connection.execute(
                 "INSERT INTO conflict_pm.vane_ray.conflict_insert_target VALUES (-1, 99, 'conflict')"
             )
+            committed_artifacts.extend(vane_attempt_artifacts(target_path))
+            require_equal(len(committed_artifacts), 1, "concurrent Ray commit artifact count")
         finally:
             mutation_connection.close()
 
@@ -1231,6 +1243,7 @@ def exercise_target_conflict_and_retry(
         CONFLICT_INSERT_TARGET,
         "target conflict",
         commit_conflicting_snapshot,
+        expected_writes=2,
     )
     require_equal(len(errors), 1, "target conflict failure count")
     if not error_chain_contains(errors[0], "snapshot changed after the distributed INSERT was planned"):
@@ -1240,7 +1253,9 @@ def exercise_target_conflict_and_retry(
         1,
         "target conflict snapshot count",
     )
-    require_equal(vane_attempt_artifacts(target_path), [], "target conflict artifact cleanup")
+    require_equal(
+        vane_attempt_artifacts(target_path), committed_artifacts, "target conflict preserves only committed artifacts"
+    )
     require_equal(
         harness.connection.execute(f"SELECT id, part, payload FROM {CONFLICT_INSERT_TARGET} ORDER BY id").fetchall(),
         [(-1, 99, "conflict")],
