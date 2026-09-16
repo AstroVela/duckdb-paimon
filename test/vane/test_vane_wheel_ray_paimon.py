@@ -17,8 +17,10 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -254,13 +256,16 @@ class RayPaimonHarness:
         self._original_run_iter_tables = runner.run_iter_tables
         self._original_run_write = runner.run_write
 
-        def record_distributed_read(*args: object, **kwargs: object) -> object:
+        def record_distributed_read(logical_plan: object) -> object:
+            require_true(isinstance(logical_plan, vane.ray_cxx.PyLogicalPlan), "Ray read requires a bound plan")
             self.read_dispatch_count += 1
-            return self._original_run_iter_tables(*args, **kwargs)
+            return self._original_run_iter_tables(logical_plan)
 
-        def record_distributed_write(*args: object, **kwargs: object) -> object:
+        def record_distributed_write(logical_plan: object) -> object:
+            require_true(isinstance(logical_plan, vane.ray_cxx.PyLogicalPlan), "Ray write requires a bound plan")
             self.write_dispatch_count += 1
-            result = self._original_run_write(*args, **kwargs)
+            self.last_write_result = None
+            result = self._original_run_write(logical_plan)
             self.last_write_result = result
             return result
 
@@ -271,13 +276,9 @@ class RayPaimonHarness:
     def capture_write_plan(self, operation: Callable[[], object]) -> object:
         captured: list[object] = []
 
-        def capture(relation: object) -> dict[str, object]:
-            captured.append(
-                self.vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-                    relation,
-                    f"vane-wheel-ray-paimon-write-{uuid.uuid4().hex}",
-                )
-            )
+        def capture(logical_plan: object) -> dict[str, object]:
+            require_true(isinstance(logical_plan, self.vane.ray_cxx.PyLogicalPlan), "captured bound write plan")
+            captured.append(logical_plan)
             return {}
 
         self.runner.run_write = capture
@@ -548,6 +549,56 @@ def snapshot_count(connection: object, table_path: Path) -> int:
     return int(
         connection.execute(f"SELECT count(*)::BIGINT FROM paimon_snapshots({sql_string(table_path)})").fetchone()[0]
     )
+
+
+def exercise_snapshot_metadata(harness: RayPaimonHarness, root: Path) -> None:
+    table_path = root / "snapshots.db/table"
+    shutil.copytree(REPOSITORY_ROOT / "data/testdb.db/testtbl", table_path)
+    snapshots = sorted(
+        (json.loads(path.read_text()) for path in (table_path / "snapshot").glob("snapshot-*")),
+        key=lambda snapshot: snapshot["id"],
+    )
+    expected = [
+        (
+            snapshot["id"],
+            snapshot["schemaId"],
+            snapshot["commitUser"],
+            snapshot["commitKind"],
+            dt.datetime(1970, 1, 1) + dt.timedelta(milliseconds=snapshot["timeMillis"]),
+            snapshot.get("totalRecordCount"),
+            snapshot.get("deltaRecordCount"),
+            snapshot.get("watermark"),
+        )
+        for snapshot in snapshots
+    ]
+    for source in (
+        f"paimon_snapshots({sql_string(table_path)})",
+        f"paimon_snapshots({sql_string(root)}, 'snapshots', 'table')",
+    ):
+        harness.require_query(f"SELECT * FROM {source} ORDER BY snapshot_id", expected, "portable snapshot rows")
+        require_equal(harness.scan_split_count(f"SELECT * FROM {source}"), 1, "singleton snapshot source")
+
+    original_read = harness.runner.run_iter_tables
+    hidden = table_path / "hidden-snapshots"
+
+    def hide_metadata_after_binding(logical_plan: object) -> object:
+        harness.runner.run_iter_tables = original_read
+        (table_path / "snapshot").rename(hidden)
+        return original_read(logical_plan)
+
+    harness.runner.run_iter_tables = hide_metadata_after_binding
+    try:
+        require_equal(
+            harness.connection.execute(
+                "SELECT * FROM paimon_snapshots(?) ORDER BY snapshot_id", [str(table_path)]
+            ).fetchall(),
+            expected,
+            "bound snapshot rows survive removal of the source metadata",
+        )
+    finally:
+        harness.runner.run_iter_tables = original_read
+        if hidden.exists():
+            hidden.rename(table_path / "snapshot")
 
 
 def vane_attempt_artifacts(table_path: Path) -> list[Path]:
@@ -1377,8 +1428,8 @@ def exercise_fail_closed_payloads(harness: RayPaimonHarness, multi_path: Path) -
 
 
 def main() -> None:
-    if os.environ.get("VANE_RUNNER") != "ray":
-        raise RuntimeError("the distributed wheel integration test requires VANE_RUNNER=ray")
+    if "VANE_RUNNER" in os.environ:
+        raise RuntimeError("leave VANE_RUNNER unset to qualify the default Ray runner")
     os.environ["VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION"] = "1"
 
     import ray
@@ -1392,9 +1443,8 @@ def main() -> None:
     connection = None
     try:
         expected_nodes = execution_node_ids(ray)
-        vane.set_runner_ray(noop_if_initialized=True)
         runner = runners.get_or_create_runner()
-        require_equal(getattr(runner, "name", None), "ray", "configured Vane runner")
+        require_equal(getattr(runner, "name", None), "ray", "default Vane runner")
 
         connection = vane.connect(
             ":memory:",
@@ -1410,6 +1460,7 @@ def main() -> None:
                 connection, warehouse
             )
             harness = RayPaimonHarness(vane, connection, runner)
+            exercise_snapshot_metadata(harness, warehouse)
             exercise_reads(
                 harness,
                 multi_path,

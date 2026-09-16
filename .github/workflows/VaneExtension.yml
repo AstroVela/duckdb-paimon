@@ -301,14 +301,13 @@ jobs:
 
   vane-wheel-paimon-integration:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
-    name: Vane dynamic wheel local Paimon integration
+    name: Vane dynamic wheel default Ray Paimon smoke
     needs: vane-dynamic-wheel
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
     env:
-      VANE_RUNNER: local-fast
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
 
     steps:
@@ -346,14 +345,13 @@ jobs:
 
   vane-wheel-ray-paimon-integration:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
-    name: Vane dynamic wheel two-worker Ray Paimon integration
+    name: Vane dynamic wheel two-worker default Ray Paimon integration
     needs: vane-dynamic-wheel
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     permissions:
       contents: read
     env:
-      VANE_RUNNER: ray
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
       RAY_DEDUP_LOGS: "0"
       VANE_UDF_TARGET_MAX_BATCH_BYTES: "4096"
@@ -1131,15 +1129,14 @@ jobs:
             --directory dist \
             --version "${{ needs.assemble-testpypi-paimon.outputs.paimon_version }}"
 
-  testpypi-local-paimon-integration:
-    name: TestPyPI local Paimon integration
+  testpypi-smoke-paimon-integration:
+    name: TestPyPI default Ray Paimon smoke
     needs: [assemble-testpypi-paimon, verify-testpypi-paimon]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
     env:
-      VANE_RUNNER: local-fast
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.operation == 'release' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
       INDEX_URL: https://test.pypi.org/simple/
       RUNTIME_INDEX_URL: ${{ inputs.operation == 'release' && 'https://pypi.org/simple/' || 'https://test.pypi.org/simple/' }}
@@ -1174,8 +1171,8 @@ jobs:
           # An explicit --index-url must not be supplemented by runner pip configuration.
           for pip_variable in "${!PIP_@}"; do unset "$pip_variable"; done
           export PIP_CONFIG_FILE=/dev/null
-          python -m venv .venv-vane-testpypi-local
-          . .venv-vane-testpypi-local/bin/activate
+          python -m venv .venv-vane-testpypi-smoke
+          . .venv-vane-testpypi-smoke/bin/activate
           python -m pip install --upgrade pip
           mkdir -p indexed
           download_exact() {
@@ -1210,17 +1207,16 @@ jobs:
           python -m pip check
 
       - name: Exercise the indexed provider locally
-        run: .venv-vane-testpypi-local/bin/python -I test/vane/test_vane_wheel_paimon.py
+        run: .venv-vane-testpypi-smoke/bin/python -I test/vane/test_vane_wheel_paimon.py
 
   testpypi-ray-paimon-integration:
-    name: TestPyPI two-worker Ray Paimon integration
+    name: TestPyPI two-worker default Ray Paimon integration
     needs: [assemble-testpypi-paimon, verify-testpypi-paimon]
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     permissions:
       contents: read
     env:
-      VANE_RUNNER: ray
       VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: ${{ inputs.operation == 'release' && 'astrovela/vane' || 'astrovela/vane-testpypi' }}
       VANE_UDF_TARGET_MAX_BATCH_BYTES: "4096"
       RAY_DEDUP_LOGS: "0"
@@ -1300,7 +1296,7 @@ jobs:
     if: inputs.operation == 'release'
     needs:
       - assemble-testpypi-paimon
-      - testpypi-local-paimon-integration
+      - testpypi-smoke-paimon-integration
       - testpypi-ray-paimon-integration
     runs-on: ubuntu-24.04
     environment:
