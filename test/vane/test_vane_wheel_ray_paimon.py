@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 TEST_DIRECTORY = Path(__file__).resolve().parent
@@ -35,6 +36,7 @@ TEST_DIRECTORY = Path(__file__).resolve().parent
 sys.path.insert(0, str(TEST_DIRECTORY))
 try:
     from packaged_dynamic_extension import load_packaged_dynamic_paimon
+    from paimon_ray_faults import ray_write_fault, release_write_preparation, wait_for_write_preparation
 finally:
     sys.path.pop(0)
 
@@ -700,46 +702,30 @@ def exercise_distributed_ctas(
         "unpartitioned distributed CTAS result",
     )
 
-    # DuckDB chooses its ordinary PhysicalCreateTable operator when a target is
-    # already visible during physical planning. Freeze the extension CTAS plan
-    # while the target is absent, then publish the competing table before Vane
-    # preparation to exercise the coordinator-owned duplicate race directly.
-    from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
-    from vane.runners.local.runner import _InProcessFragmentExecutor
-
     duplicate_logical_plan = harness.capture_write_plan(
         lambda: source_insert_relation(harness, multi_path).create(DUPLICATE_CTAS_TARGET)
     )
-    duplicate_physical_plan = duplicate_logical_plan.to_physical_plan(connection)
-    connection.execute(f"CREATE TABLE {DUPLICATE_CTAS_TARGET} (id INTEGER, part INTEGER, payload VARCHAR)")
-    executor = _InProcessFragmentExecutor()
-    backend = NativeFteWorkerManagerBackend(
-        execute_fn=executor,
-        num_workers=WORKER_COUNT,
-        max_running_tasks=WORKER_COUNT,
-    )
-    submit_calls = 0
-    original_submit_tasks = backend.submit_tasks
-
-    def count_duplicate_tasks(tasks: object) -> list[object]:
-        nonlocal submit_calls
-        submit_calls += 1
-        return list(original_submit_tasks(tasks))
-
-    backend.submit_tasks = count_duplicate_tasks
-    duplicate_plan_runner = harness.vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
-    try:
-        require_error(
-            "duplicate distributed Paimon CTAS preparation",
-            lambda: duplicate_plan_runner.run_copy_plan(duplicate_physical_plan, connection),
-            "already exists before distributed CTAS preparation",
-        )
-        require_equal(submit_calls, 0, "duplicate CTAS worker submissions")
-    finally:
-        try:
-            backend.shutdown()
-        finally:
-            executor.close()
+    previous_count = harness.write_dispatch_count
+    with ray_write_fault(
+        harness.runner,
+        str(duplicate_logical_plan.idx()),
+        "ctas-race",
+    ) as fault:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            write = executor.submit(harness.runner.run_write, duplicate_logical_plan)
+            try:
+                wait_for_write_preparation(harness.runner)
+                connection.execute(f"CREATE TABLE {DUPLICATE_CTAS_TARGET} (id INTEGER, part INTEGER, payload VARCHAR)")
+            finally:
+                release_write_preparation(harness.runner)
+            require_error(
+                "duplicate distributed Paimon CTAS preparation",
+                lambda: write.result(timeout=120),
+                "already exists before distributed CTAS preparation",
+            )
+    require_equal(harness.write_dispatch_count, previous_count + 1, "duplicate CTAS Ray dispatch")
+    require_equal(fault["prepared"], 1, "duplicate CTAS driver preparation")
+    require_equal(fault["submissions"], 0, "duplicate CTAS worker submissions")
     require_equal(snapshot_count(connection, target_paths[DUPLICATE_CTAS_TARGET]), 0, "duplicate CTAS snapshots")
     require_equal(
         connection.execute(f"SELECT count(*)::BIGINT FROM {DUPLICATE_CTAS_TARGET}").fetchone(),
@@ -790,104 +776,38 @@ def exercise_duplicate_retry_attempt_metadata(
     multi_path: Path,
     target_path: Path,
 ) -> None:
-    from vane.runners.fte import FteTaskAttemptId
-    from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
-    from vane.runners.local.runner import _InProcessFragmentExecutor
-
-    class PackagedPaimonFragmentExecutor(_InProcessFragmentExecutor):
-        def _get_conn(self) -> object:
-            existing = getattr(self._local, "conn", None)
-            connection = super()._get_conn()
-            if existing is None:
-                # This test backend intentionally bypasses Ray worker
-                # preparation, so prepare each thread-owned worker connection
-                # with the same installed provider as a real worker.
-                load_packaged_dynamic_paimon(connection)
-            return connection
-
     baseline_files = table_file_inventory(target_path)
     logical_plan = harness.capture_write_plan(
         lambda: source_insert_relation(harness, multi_path).insert_into(ATTEMPT_METADATA_INSERT_TARGET)
     )
-    physical_plan = logical_plan.to_physical_plan(harness.connection)
-    executor = PackagedPaimonFragmentExecutor()
-    backend = NativeFteWorkerManagerBackend(
-        execute_fn=executor,
-        num_workers=WORKER_COUNT,
-        max_running_tasks=WORKER_COUNT,
+    previous_count = harness.write_dispatch_count
+    with ray_write_fault(harness.runner, str(logical_plan.idx()), "duplicate-attempt") as fault:
+        require_error(
+            "duplicate Paimon attempt metadata through Ray",
+            lambda: harness.runner.run_write(logical_plan),
+            "selected multiple attempts for Vane logical task",
+        )
+    require_equal(harness.write_dispatch_count, previous_count + 1, "attempt metadata Ray dispatch")
+    require_equal(fault["prepared"], 1, "attempt metadata driver preparation")
+    require_equal(len(fault["workers"]), 1, "duplicate injection real Ray worker count")
+    worker = fault["workers"][0]
+    require_equal(len(worker["attempts"]), 2, "genuine native attempt envelope count")
+    require_true(worker["worker_pid"] != os.getpid(), "duplicate attempt ran on the client")
+    result = fault["native_result"]
+    require_equal(result.get("extension_write"), True, "attempt metadata extension write marker")
+    require_equal(result.get("extension_catalog_committed"), False, "attempt metadata catalog commit marker")
+    require_equal(result.get("copy_output_outcome_unknown"), True, "attempt metadata runner outcome")
+    require_true(
+        "selected multiple attempts for Vane logical task" in str(result.get("copy_output_outcome_error") or ""),
+        "attempt metadata rejection did not reach the Paimon coordinator",
     )
-    original_submit_tasks = backend.submit_tasks
-    retried_attempt_ids: list[str] = []
-
-    def submit_with_retried_attempt(tasks: object) -> list[object]:
-        task_list = list(tasks)
-        handles = list(original_submit_tasks(task_list))
-        if task_list and handles and not retried_attempt_ids:
-            retry_request = backend._request_from_task(task_list[0])
-            selected_id = FteTaskAttemptId.coerce(retry_request["task_id"])
-            retry_id = FteTaskAttemptId(selected_id.task_id, selected_id.attempt_id + 1)
-            retried_attempt_ids.append(str(retry_id))
-            retry_request["task_id"] = retry_id.to_dict()
-            retry_context = dict(retry_request.get("context") or {})
-            retry_context["attempt_id"] = str(retry_id.attempt_id)
-            retry_request["context"] = retry_context
-            # Execute a genuine retry of the same logical task. Vane's generic
-            # envelope parser sees two unique attempt IDs; Paimon must reject
-            # selecting both attempts for one logical task before committing.
-            handles.extend(original_submit_tasks([retry_request]))
-        return handles
-
-    backend.submit_tasks = submit_with_retried_attempt
-    plan_runner = harness.vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
-    try:
-        result = plan_runner.run_copy_plan(physical_plan, harness.connection)
-        require_equal(
-            result.get("extension_write"),
-            True,
-            "attempt metadata extension write marker",
-        )
-        require_equal(
-            result.get("extension_catalog_committed"),
-            False,
-            "attempt metadata catalog commit marker",
-        )
-        require_equal(
-            result.get("copy_output_outcome_unknown"),
-            True,
-            "attempt metadata runner outcome",
-        )
-        require_true(
-            "selected multiple attempts for Vane logical task" in str(result.get("copy_output_outcome_error") or ""),
-            "attempt metadata rejection did not reach the Paimon coordinator",
-        )
-        require_true(
-            int(result.get("extension_task_result_count") or 0) > WORKER_COUNT,
-            "attempt metadata rejection did not select the retried task result",
-        )
-        require_true(
-            bool(retried_attempt_ids),
-            "duplicate/retried attempt injection did not reach a write task",
-        )
-        require_equal(
-            snapshot_count(harness.connection, target_path),
-            0,
-            "attempt metadata failure snapshots",
-        )
-        require_equal(
-            vane_attempt_artifacts(target_path),
-            [],
-            "attempt metadata failure artifact cleanup",
-        )
-        require_equal(
-            table_file_inventory(target_path),
-            baseline_files,
-            "attempt metadata failure file cleanup",
-        )
-    finally:
-        try:
-            backend.shutdown()
-        finally:
-            executor.close()
+    require_true(
+        int(result.get("extension_task_result_count") or 0) >= 2,
+        "attempt metadata rejection did not select both native task results",
+    )
+    require_equal(snapshot_count(harness.connection, target_path), 0, "attempt metadata failure snapshots")
+    require_equal(vane_attempt_artifacts(target_path), [], "attempt metadata failure artifact cleanup")
+    require_equal(table_file_inventory(target_path), baseline_files, "attempt metadata failure file cleanup")
 
     harness.require_write(
         "distributed Paimon INSERT retry after attempt metadata rejection",

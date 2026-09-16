@@ -24,7 +24,7 @@ python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
   --directory build/vane-testpypi-wheel-dist \
-  --vane-version 0.2.0.dev657 \
+  --vane-version 0.2.0.dev660 \
   --channel testpypi-dev \
   --require-publishable-on testpypi
 ```
@@ -62,7 +62,7 @@ changing native dependency versions or development package versioning.
 | `testpypi-dev` | Exact development `vane-ai` wheels from TestPyPI | `astrovela/vane-testpypi` | TestPyPI only |
 | `release` | Exact non-development `vane-ai` wheels from PyPI | `astrovela/vane` | TestPyPI, qualification, approval, then identical files to PyPI |
 
-The development manifest `vane-extension.toml` pins dev657.
+The development manifest `vane-extension.toml` pins dev660.
 `vane-extension-release.toml` is a separate committed, exact source pin. Its
 initial `033b549afcb498633fd6669b26c054c00363004e` commit contains the production
 public key but **is not a published Vane release**. Consequently `release` fails
@@ -137,10 +137,17 @@ development CI, not a production publication or production-native qualification.
 
 ## Default Ray qualification
 
-Both manifests pin Vane `3c9ed18e29c586e9d5448c74440e8ea55469a749`.
+Both manifests pin Vane `4e12994a2fed5b872a7bdb44df72c1b9c5653cdc`.
 The smoke and distributed suites require `VANE_RUNNER` to be absent and verify
 Ray dispatch without a runner selection API. Fixtures and readback use that
 same default runner. A test-owned two-worker cluster controls resources only.
+The duplicate CTAS race pauses the Ray driver after physical planning, creates
+the competing table through client SQL, and must fail before worker submission.
+Duplicate-attempt validation corrupts one real Ray task's native identity so
+two tasks produce valid envelopes for different attempts of one logical task.
+It checks coordinator rejection, cleanup and successful explicit retry.
+Paimon qualification currently uses filesystem tables; it does not claim S3 or
+MinIO coverage.
 
 `paimon_snapshots()` resolves completed snapshot rows during binding and sends
 one portable scan to Ray. Reusing a bound plan preserves its snapshot rows;
