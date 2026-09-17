@@ -138,7 +138,7 @@ development CI, not a production publication or production-native qualification.
 ## Default Ray qualification
 
 The development manifest pins Vane `d1460a580455f01485e2e508e05d0049cb18a105` (`0.2.0.dev663`);
-the production preparation manifest retains `4e12994a2fed5b872a7bdb44df72c1b9c5653cdc`.
+the production preparation manifest also pins `d1460a580455f01485e2e508e05d0049cb18a105`.
 The smoke and distributed suites require `VANE_RUNNER` to be absent and verify
 Ray dispatch without a runner selection API. Fixtures and readback use that
 same default runner. A test-owned two-worker cluster controls resources only.

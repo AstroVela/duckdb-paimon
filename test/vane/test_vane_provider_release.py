@@ -160,7 +160,7 @@ def exercise_integration_pins() -> None:
         raise AssertionError("the development runtime must use the reviewed latest-main pin")
     with (REPOSITORY_ROOT / "vane-extension-release.toml").open("rb") as source:
         production_manifest = tomllib.load(source)
-    if production_manifest["vane"]["revision"] != "4e12994a2fed5b872a7bdb44df72c1b9c5653cdc":
+    if production_manifest["vane"]["revision"] != "d1460a580455f01485e2e508e05d0049cb18a105":
         raise AssertionError("production preparation must use the reviewed public-key pin")
     production_manifest["vane"]["revision"] = manifest["vane"]["revision"]
     if production_manifest != manifest:
