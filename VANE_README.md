@@ -259,16 +259,32 @@ cover scans, snapshots, CTAS, append, partitioning, conflicts, and failure clean
 ## Tested examples
 
 All nine Python blocks above were executed sequentially on 2026-09-17 with
-Python 3.12, non-editable provider wheels, and `vane-ai==0.2.0.dev660` from
-Vane revision `4e12994a2fed5b872a7bdb44df72c1b9c5653cdc`. The Paimon native
-sources matched this branch at `6574b3e`.
+Python 3.12 and `vane-ai==0.2.0.dev663`, built from the Vane `main` head selected
+for this run: `d1460a580455f01485e2e508e05d0049cb18a105`. The Paimon provider
+was rebuilt against that exact revision and installed as a non-editable wheel.
+The runtime's native SourceID was verified as `d8a9d61d59`.
 
-The test left `VANE_RUNNER` unset, verified that the selected runner was Ray,
-and used an owned cluster with two CPU execution nodes on one physical host.
-All blocks passed in 38.06 seconds, with 13 Ray read dispatches and two Ray
-writes including additional assertions. Checks compared all 1,100 rows,
-per-bucket totals, both snapshots, and the complete initial snapshot totals.
+The test left `VANE_RUNNER` unset, verified the default Ray runner, and used
+an owned cluster with two CPU execution nodes on one physical host. All blocks
+passed in 38.08 seconds, with 13 Ray read dispatches and two Ray writes including
+additional assertions. Checks compared all 1,100 rows, per-bucket totals,
+both snapshots, and the initial snapshot totals.
 
-This validates the local provider walkthrough, not cloud storage, a multi-host
-cluster, or the source-build recipe. Installation used matching local wheels;
-the TestPyPI placeholders above must be replaced with published versions.
+This validates the local provider walkthrough, not cloud storage or a multi-host
+cluster. Matching local wheels were built and installed; the TestPyPI placeholders
+must be replaced with published versions. The alternative static-wheel recipe
+was not run by this walkthrough test.
+
+## Re-run the walkthrough test
+
+With matching provider and Vane wheels installed, run the checked-in test from
+this extension's checkout. Leave `VANE_RUNNER` and `RAY_ADDRESS` unset:
+
+```bash
+python -m pip install pytest
+python -I -m pytest -q -s test/vane/test_vane_readme.py
+```
+
+The test executes the Python blocks from this guide in a fresh temporary
+directory, asserts the default Ray runner, checks the resulting data, and owns
+and cleans up a same-host Ray cluster with two CPU execution nodes.
