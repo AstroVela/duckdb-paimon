@@ -24,7 +24,7 @@ python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
   --directory build/vane-testpypi-wheel-dist \
-  --vane-version 0.2.0.dev612 \
+  --vane-version 0.2.0.dev660 \
   --channel testpypi-dev \
   --require-publishable-on testpypi
 ```
@@ -42,15 +42,15 @@ and index edge cases are tested in the shared repository; this repository tests
 its real configuration and workflow integration plus private-key consumption.
 
 The native Paimon builder, license collection, signing, exact Vane artifact
-verification and local/two-worker Ray tests remain here. Uploads run directly in
-this repository's `VaneExtension.yml`; PyPI does not support a reusable workflow
+verification and default Ray smoke/two-worker tests remain here. Uploads run
+directly in this repository's `VaneExtension.yml`; PyPI does not support a reusable workflow
 as the Trusted Publisher. The existing development `testpypi` environment and
 Trusted Publisher remain unchanged.
 
 The current shared native integration uses manifest schema 2, requiring an
 explicit official vcpkg revision. Paimon's `vane-extension.toml` keeps the same
-revision as its existing `vcpkg.json`; this integration does not change the Vane
-revision, native dependency versions or development package versioning.
+revision as its existing `vcpkg.json`; this update changes the Vane pin without
+changing native dependency versions or development package versioning.
 
 ## Production preparation and activation
 
@@ -62,7 +62,7 @@ revision, native dependency versions or development package versioning.
 | `testpypi-dev` | Exact development `vane-ai` wheels from TestPyPI | `astrovela/vane-testpypi` | TestPyPI only |
 | `release` | Exact non-development `vane-ai` wheels from PyPI | `astrovela/vane` | TestPyPI, qualification, approval, then identical files to PyPI |
 
-The development manifest `vane-extension.toml` remains pinned to dev612.
+The development manifest `vane-extension.toml` pins dev660.
 `vane-extension-release.toml` is a separate committed, exact source pin. Its
 initial `033b549afcb498633fd6669b26c054c00363004e` commit contains the production
 public key but **is not a published Vane release**. Consequently `release` fails
@@ -111,8 +111,8 @@ job with the private key; the private key is never an artifact. The existing
 CI-only `full` path can use only the public CI fixture key. A missing production
 secret cannot select the development secret.
 
-Those same wheels are staged on TestPyPI. Both local and two-worker Ray tests
-download the staged provider, compare its bytes to the digest-verified candidate
+Those same wheels are staged on TestPyPI. Both smoke and two-worker default Ray
+tests download the staged provider, compare its bytes to the digest-verified candidate
 artifact, and use the production runtime from PyPI. No mixed-index resolver or
 runtime fallback is used. Ordinary runtime dependencies still come from PyPI.
 
@@ -134,3 +134,23 @@ Environment protection, secrets and Trusted Publisher registration are explicit
 administrator setup steps; merging this preparation does not configure them or
 trigger a release. A `build-only` run exercises the guarded tooling and existing
 development CI, not a production publication or production-native qualification.
+
+## Default Ray qualification
+
+Both manifests pin Vane `4e12994a2fed5b872a7bdb44df72c1b9c5653cdc`.
+The smoke and distributed suites require `VANE_RUNNER` to be absent and verify
+Ray dispatch without a runner selection API. Fixtures and readback use that
+same default runner. A test-owned two-worker cluster controls resources only.
+The duplicate CTAS race pauses the Ray driver after physical planning, creates
+the competing table through client SQL, and must fail before worker submission.
+Duplicate-attempt validation corrupts one real Ray task's native identity so
+two tasks produce valid envelopes for different attempts of one logical task.
+It checks coordinator rejection, cleanup and successful explicit retry.
+Paimon qualification currently uses filesystem tables; it does not claim S3 or
+MinIO coverage.
+
+`paimon_snapshots()` resolves completed snapshot rows during binding and sends
+one portable scan to Ray. Reusing a bound plan preserves its snapshot rows;
+creating a new query observes current metadata. Neither worker retries nor
+serialization retain catalog pointers or credentials. Tables without UUIDs can
+be read, but distributed writes reject them before committing any data.

@@ -17,14 +17,17 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
 import time
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 TEST_DIRECTORY = Path(__file__).resolve().parent
@@ -33,6 +36,7 @@ TEST_DIRECTORY = Path(__file__).resolve().parent
 sys.path.insert(0, str(TEST_DIRECTORY))
 try:
     from packaged_dynamic_extension import load_packaged_dynamic_paimon
+    from paimon_ray_faults import ray_write_fault, release_write_preparation, wait_for_write_preparation
 finally:
     sys.path.pop(0)
 
@@ -254,13 +258,16 @@ class RayPaimonHarness:
         self._original_run_iter_tables = runner.run_iter_tables
         self._original_run_write = runner.run_write
 
-        def record_distributed_read(*args: object, **kwargs: object) -> object:
+        def record_distributed_read(logical_plan: object) -> object:
+            require_true(isinstance(logical_plan, vane.ray_cxx.PyLogicalPlan), "Ray read requires a bound plan")
             self.read_dispatch_count += 1
-            return self._original_run_iter_tables(*args, **kwargs)
+            return self._original_run_iter_tables(logical_plan)
 
-        def record_distributed_write(*args: object, **kwargs: object) -> object:
+        def record_distributed_write(logical_plan: object) -> object:
+            require_true(isinstance(logical_plan, vane.ray_cxx.PyLogicalPlan), "Ray write requires a bound plan")
             self.write_dispatch_count += 1
-            result = self._original_run_write(*args, **kwargs)
+            self.last_write_result = None
+            result = self._original_run_write(logical_plan)
             self.last_write_result = result
             return result
 
@@ -271,18 +278,20 @@ class RayPaimonHarness:
     def capture_write_plan(self, operation: Callable[[], object]) -> object:
         captured: list[object] = []
 
-        def capture(relation: object) -> dict[str, object]:
-            captured.append(
-                self.vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-                    relation,
-                    f"vane-wheel-ray-paimon-write-{uuid.uuid4().hex}",
-                )
-            )
-            return {}
+        class PlanCaptured(Exception):
+            pass
+
+        def capture(logical_plan: object) -> None:
+            require_true(isinstance(logical_plan, self.vane.ray_cxx.PyLogicalPlan), "captured bound write plan")
+            captured.append(logical_plan)
+            raise PlanCaptured
 
         self.runner.run_write = capture
         try:
-            operation()
+            try:
+                operation()
+            except PlanCaptured:
+                pass
         finally:
             self.runner.run_write = self._record_distributed_write
         require_equal(len(captured), 1, "captured distributed Paimon write plan count")
@@ -550,6 +559,56 @@ def snapshot_count(connection: object, table_path: Path) -> int:
     )
 
 
+def exercise_snapshot_metadata(harness: RayPaimonHarness, root: Path) -> None:
+    table_path = root / "snapshots.db/table"
+    shutil.copytree(REPOSITORY_ROOT / "data/testdb.db/testtbl", table_path)
+    snapshots = sorted(
+        (json.loads(path.read_text()) for path in (table_path / "snapshot").glob("snapshot-*")),
+        key=lambda snapshot: snapshot["id"],
+    )
+    expected = [
+        (
+            snapshot["id"],
+            snapshot["schemaId"],
+            snapshot["commitUser"],
+            snapshot["commitKind"],
+            dt.datetime(1970, 1, 1) + dt.timedelta(milliseconds=snapshot["timeMillis"]),
+            snapshot.get("totalRecordCount"),
+            snapshot.get("deltaRecordCount"),
+            snapshot.get("watermark"),
+        )
+        for snapshot in snapshots
+    ]
+    for source in (
+        f"paimon_snapshots({sql_string(table_path)})",
+        f"paimon_snapshots({sql_string(root)}, 'snapshots', 'table')",
+    ):
+        harness.require_query(f"SELECT * FROM {source} ORDER BY snapshot_id", expected, "portable snapshot rows")
+        require_equal(harness.scan_split_count(f"SELECT * FROM {source}"), 1, "singleton snapshot source")
+
+    original_read = harness.runner.run_iter_tables
+    hidden = table_path / "hidden-snapshots"
+
+    def hide_metadata_after_binding(logical_plan: object) -> object:
+        harness.runner.run_iter_tables = original_read
+        (table_path / "snapshot").rename(hidden)
+        return original_read(logical_plan)
+
+    harness.runner.run_iter_tables = hide_metadata_after_binding
+    try:
+        require_equal(
+            harness.connection.execute(
+                "SELECT * FROM paimon_snapshots(?) ORDER BY snapshot_id", [str(table_path)]
+            ).fetchall(),
+            expected,
+            "bound snapshot rows survive removal of the source metadata",
+        )
+    finally:
+        harness.runner.run_iter_tables = original_read
+        if hidden.exists():
+            hidden.rename(table_path / "snapshot")
+
+
 def vane_attempt_artifacts(table_path: Path) -> list[Path]:
     return sorted(path for path in table_path.rglob("vane_*") if path.is_file())
 
@@ -643,46 +702,30 @@ def exercise_distributed_ctas(
         "unpartitioned distributed CTAS result",
     )
 
-    # DuckDB chooses its ordinary PhysicalCreateTable operator when a target is
-    # already visible during physical planning. Freeze the extension CTAS plan
-    # while the target is absent, then publish the competing table before Vane
-    # preparation to exercise the coordinator-owned duplicate race directly.
-    from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
-    from vane.runners.local.runner import _InProcessFragmentExecutor
-
     duplicate_logical_plan = harness.capture_write_plan(
         lambda: source_insert_relation(harness, multi_path).create(DUPLICATE_CTAS_TARGET)
     )
-    duplicate_physical_plan = duplicate_logical_plan.to_physical_plan(connection)
-    connection.execute(f"CREATE TABLE {DUPLICATE_CTAS_TARGET} (id INTEGER, part INTEGER, payload VARCHAR)")
-    executor = _InProcessFragmentExecutor()
-    backend = NativeFteWorkerManagerBackend(
-        execute_fn=executor,
-        num_workers=WORKER_COUNT,
-        max_running_tasks=WORKER_COUNT,
-    )
-    submit_calls = 0
-    original_submit_tasks = backend.submit_tasks
-
-    def count_duplicate_tasks(tasks: object) -> list[object]:
-        nonlocal submit_calls
-        submit_calls += 1
-        return list(original_submit_tasks(tasks))
-
-    backend.submit_tasks = count_duplicate_tasks
-    duplicate_plan_runner = harness.vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
-    try:
-        require_error(
-            "duplicate distributed Paimon CTAS preparation",
-            lambda: duplicate_plan_runner.run_copy_plan(duplicate_physical_plan, connection),
-            "already exists before distributed CTAS preparation",
-        )
-        require_equal(submit_calls, 0, "duplicate CTAS worker submissions")
-    finally:
-        try:
-            backend.shutdown()
-        finally:
-            executor.close()
+    previous_count = harness.write_dispatch_count
+    with ray_write_fault(
+        harness.runner,
+        str(duplicate_logical_plan.idx()),
+        "ctas-race",
+    ) as fault:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            write = executor.submit(harness.runner.run_write, duplicate_logical_plan)
+            try:
+                wait_for_write_preparation(harness.runner)
+                connection.execute(f"CREATE TABLE {DUPLICATE_CTAS_TARGET} (id INTEGER, part INTEGER, payload VARCHAR)")
+            finally:
+                release_write_preparation(harness.runner)
+            require_error(
+                "duplicate distributed Paimon CTAS preparation",
+                lambda: write.result(timeout=120),
+                "already exists before distributed CTAS preparation",
+            )
+    require_equal(harness.write_dispatch_count, previous_count + 1, "duplicate CTAS Ray dispatch")
+    require_equal(fault["prepared"], 1, "duplicate CTAS driver preparation")
+    require_equal(fault["submissions"], 0, "duplicate CTAS worker submissions")
     require_equal(snapshot_count(connection, target_paths[DUPLICATE_CTAS_TARGET]), 0, "duplicate CTAS snapshots")
     require_equal(
         connection.execute(f"SELECT count(*)::BIGINT FROM {DUPLICATE_CTAS_TARGET}").fetchone(),
@@ -733,104 +776,38 @@ def exercise_duplicate_retry_attempt_metadata(
     multi_path: Path,
     target_path: Path,
 ) -> None:
-    from vane.runners.fte import FteTaskAttemptId
-    from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
-    from vane.runners.local.runner import _InProcessFragmentExecutor
-
-    class PackagedPaimonFragmentExecutor(_InProcessFragmentExecutor):
-        def _get_conn(self) -> object:
-            existing = getattr(self._local, "conn", None)
-            connection = super()._get_conn()
-            if existing is None:
-                # This test backend intentionally bypasses Ray worker
-                # preparation, so prepare each thread-owned worker connection
-                # with the same installed provider as a real worker.
-                load_packaged_dynamic_paimon(connection)
-            return connection
-
     baseline_files = table_file_inventory(target_path)
     logical_plan = harness.capture_write_plan(
         lambda: source_insert_relation(harness, multi_path).insert_into(ATTEMPT_METADATA_INSERT_TARGET)
     )
-    physical_plan = logical_plan.to_physical_plan(harness.connection)
-    executor = PackagedPaimonFragmentExecutor()
-    backend = NativeFteWorkerManagerBackend(
-        execute_fn=executor,
-        num_workers=WORKER_COUNT,
-        max_running_tasks=WORKER_COUNT,
+    previous_count = harness.write_dispatch_count
+    with ray_write_fault(harness.runner, str(logical_plan.idx()), "duplicate-attempt") as fault:
+        require_error(
+            "duplicate Paimon attempt metadata through Ray",
+            lambda: harness.runner.run_write(logical_plan),
+            "selected multiple attempts for Vane logical task",
+        )
+    require_equal(harness.write_dispatch_count, previous_count + 1, "attempt metadata Ray dispatch")
+    require_equal(fault["prepared"], 1, "attempt metadata driver preparation")
+    require_equal(len(fault["workers"]), 1, "duplicate injection real Ray worker count")
+    worker = fault["workers"][0]
+    require_equal(len(worker["attempts"]), 2, "genuine native attempt envelope count")
+    require_true(worker["worker_pid"] != os.getpid(), "duplicate attempt ran on the client")
+    result = fault["native_result"]
+    require_equal(result.get("extension_write"), True, "attempt metadata extension write marker")
+    require_equal(result.get("extension_catalog_committed"), False, "attempt metadata catalog commit marker")
+    require_equal(result.get("copy_output_outcome_unknown"), True, "attempt metadata runner outcome")
+    require_true(
+        "selected multiple attempts for Vane logical task" in str(result.get("copy_output_outcome_error") or ""),
+        "attempt metadata rejection did not reach the Paimon coordinator",
     )
-    original_submit_tasks = backend.submit_tasks
-    retried_attempt_ids: list[str] = []
-
-    def submit_with_retried_attempt(tasks: object) -> list[object]:
-        task_list = list(tasks)
-        handles = list(original_submit_tasks(task_list))
-        if task_list and handles and not retried_attempt_ids:
-            retry_request = backend._request_from_task(task_list[0])
-            selected_id = FteTaskAttemptId.coerce(retry_request["task_id"])
-            retry_id = FteTaskAttemptId(selected_id.task_id, selected_id.attempt_id + 1)
-            retried_attempt_ids.append(str(retry_id))
-            retry_request["task_id"] = retry_id.to_dict()
-            retry_context = dict(retry_request.get("context") or {})
-            retry_context["attempt_id"] = str(retry_id.attempt_id)
-            retry_request["context"] = retry_context
-            # Execute a genuine retry of the same logical task. Vane's generic
-            # envelope parser sees two unique attempt IDs; Paimon must reject
-            # selecting both attempts for one logical task before committing.
-            handles.extend(original_submit_tasks([retry_request]))
-        return handles
-
-    backend.submit_tasks = submit_with_retried_attempt
-    plan_runner = harness.vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
-    try:
-        result = plan_runner.run_copy_plan(physical_plan, harness.connection)
-        require_equal(
-            result.get("extension_write"),
-            True,
-            "attempt metadata extension write marker",
-        )
-        require_equal(
-            result.get("extension_catalog_committed"),
-            False,
-            "attempt metadata catalog commit marker",
-        )
-        require_equal(
-            result.get("copy_output_outcome_unknown"),
-            True,
-            "attempt metadata runner outcome",
-        )
-        require_true(
-            "selected multiple attempts for Vane logical task" in str(result.get("copy_output_outcome_error") or ""),
-            "attempt metadata rejection did not reach the Paimon coordinator",
-        )
-        require_true(
-            int(result.get("extension_task_result_count") or 0) > WORKER_COUNT,
-            "attempt metadata rejection did not select the retried task result",
-        )
-        require_true(
-            bool(retried_attempt_ids),
-            "duplicate/retried attempt injection did not reach a write task",
-        )
-        require_equal(
-            snapshot_count(harness.connection, target_path),
-            0,
-            "attempt metadata failure snapshots",
-        )
-        require_equal(
-            vane_attempt_artifacts(target_path),
-            [],
-            "attempt metadata failure artifact cleanup",
-        )
-        require_equal(
-            table_file_inventory(target_path),
-            baseline_files,
-            "attempt metadata failure file cleanup",
-        )
-    finally:
-        try:
-            backend.shutdown()
-        finally:
-            executor.close()
+    require_true(
+        int(result.get("extension_task_result_count") or 0) >= 2,
+        "attempt metadata rejection did not select both native task results",
+    )
+    require_equal(snapshot_count(harness.connection, target_path), 0, "attempt metadata failure snapshots")
+    require_equal(vane_attempt_artifacts(target_path), [], "attempt metadata failure artifact cleanup")
+    require_equal(table_file_inventory(target_path), baseline_files, "attempt metadata failure file cleanup")
 
     harness.require_write(
         "distributed Paimon INSERT retry after attempt metadata rejection",
@@ -985,6 +962,8 @@ def run_blocked_distributed_insert(
     target: str,
     description: str,
     mutation: Callable[[], None],
+    *,
+    expected_writes: int = 1,
 ) -> list[BaseException]:
     marker = uuid.uuid4().hex
     started_path = target_path.parent.parent / f".vane-paimon-{marker}-started"
@@ -1047,7 +1026,7 @@ def run_blocked_distributed_insert(
         raise AssertionError(f"distributed Paimon {description} write did not stop")
     if coordination_error is not None:
         raise coordination_error
-    require_equal(harness.write_dispatch_count, previous_count + 1, f"{description} Ray dispatch")
+    require_equal(harness.write_dispatch_count, previous_count + expected_writes, f"{description} Ray dispatch")
     return errors
 
 
@@ -1155,6 +1134,8 @@ def exercise_target_conflict_and_retry(
     multi_path: Path,
     target_path: Path,
 ) -> None:
+    committed_artifacts: list[Path] = []
+
     def commit_conflicting_snapshot() -> None:
         mutation_connection = harness.vane.connect(
             ":memory:",
@@ -1170,6 +1151,8 @@ def exercise_target_conflict_and_retry(
             mutation_connection.execute(
                 "INSERT INTO conflict_pm.vane_ray.conflict_insert_target VALUES (-1, 99, 'conflict')"
             )
+            committed_artifacts.extend(vane_attempt_artifacts(target_path))
+            require_equal(len(committed_artifacts), 1, "concurrent Ray commit artifact count")
         finally:
             mutation_connection.close()
 
@@ -1180,6 +1163,7 @@ def exercise_target_conflict_and_retry(
         CONFLICT_INSERT_TARGET,
         "target conflict",
         commit_conflicting_snapshot,
+        expected_writes=2,
     )
     require_equal(len(errors), 1, "target conflict failure count")
     if not error_chain_contains(errors[0], "snapshot changed after the distributed INSERT was planned"):
@@ -1189,7 +1173,9 @@ def exercise_target_conflict_and_retry(
         1,
         "target conflict snapshot count",
     )
-    require_equal(vane_attempt_artifacts(target_path), [], "target conflict artifact cleanup")
+    require_equal(
+        vane_attempt_artifacts(target_path), committed_artifacts, "target conflict preserves only committed artifacts"
+    )
     require_equal(
         harness.connection.execute(f"SELECT id, part, payload FROM {CONFLICT_INSERT_TARGET} ORDER BY id").fetchall(),
         [(-1, 99, "conflict")],
@@ -1377,8 +1363,8 @@ def exercise_fail_closed_payloads(harness: RayPaimonHarness, multi_path: Path) -
 
 
 def main() -> None:
-    if os.environ.get("VANE_RUNNER") != "ray":
-        raise RuntimeError("the distributed wheel integration test requires VANE_RUNNER=ray")
+    if "VANE_RUNNER" in os.environ:
+        raise RuntimeError("leave VANE_RUNNER unset to qualify the default Ray runner")
     os.environ["VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION"] = "1"
 
     import ray
@@ -1392,9 +1378,8 @@ def main() -> None:
     connection = None
     try:
         expected_nodes = execution_node_ids(ray)
-        vane.set_runner_ray(noop_if_initialized=True)
         runner = runners.get_or_create_runner()
-        require_equal(getattr(runner, "name", None), "ray", "configured Vane runner")
+        require_equal(getattr(runner, "name", None), "ray", "default Vane runner")
 
         connection = vane.connect(
             ":memory:",
@@ -1410,6 +1395,7 @@ def main() -> None:
                 connection, warehouse
             )
             harness = RayPaimonHarness(vane, connection, runner)
+            exercise_snapshot_metadata(harness, warehouse)
             exercise_reads(
                 harness,
                 multi_path,

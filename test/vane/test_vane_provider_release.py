@@ -156,11 +156,11 @@ def exercise_integration_pins() -> None:
         raise AssertionError("integration must use the current explicit-vcpkg contract")
     if manifest["vcpkg"]["revision"] != vcpkg["builtin-baseline"]:
         raise AssertionError("native and dynamic Paimon lanes must use the same reviewed vcpkg revision")
-    if manifest["vane"]["revision"] != "472df75ab51fd3eac2642f6646545075549e5921":
-        raise AssertionError("the existing development runtime pin must remain unchanged")
+    if manifest["vane"]["revision"] != "4e12994a2fed5b872a7bdb44df72c1b9c5653cdc":
+        raise AssertionError("the development runtime must use the reviewed latest-main pin")
     with (REPOSITORY_ROOT / "vane-extension-release.toml").open("rb") as source:
         production_manifest = tomllib.load(source)
-    if production_manifest["vane"]["revision"] != "033b549afcb498633fd6669b26c054c00363004e":
+    if production_manifest["vane"]["revision"] != "4e12994a2fed5b872a7bdb44df72c1b9c5653cdc":
         raise AssertionError("production preparation must use the reviewed public-key pin")
     production_manifest["vane"]["revision"] = manifest["vane"]["revision"]
     if production_manifest != manifest:
@@ -302,7 +302,7 @@ def exercise_workflow_contract() -> None:
         "assemble-testpypi-paimon",
         "publish-testpypi-paimon",
         "verify-testpypi-paimon",
-        "testpypi-local-paimon-integration",
+        "testpypi-smoke-paimon-integration",
         "testpypi-ray-paimon-integration",
         "verify-pypi-promotion",
         "publish-pypi-paimon",
@@ -321,7 +321,7 @@ def exercise_workflow_contract() -> None:
                     raise AssertionError("candidate downloads must use the reviewed v8 artifact implementation")
                 if step["with"].get("digest-mismatch") != "error":
                     raise AssertionError("an artifact digest mismatch must fail closed")
-    smoke_jobs = {"testpypi-local-paimon-integration", "testpypi-ray-paimon-integration"}
+    smoke_jobs = {"testpypi-smoke-paimon-integration", "testpypi-ray-paimon-integration"}
     for job_name in smoke_jobs:
         smoke = jobs[job_name]
         scripts = "\n".join(step.get("run", "") for step in smoke["steps"])

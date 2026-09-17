@@ -31,6 +31,10 @@ TEST_DIRECTORY = Path(__file__).resolve().parent
 sys.path.insert(0, str(TEST_DIRECTORY))
 try:
     from packaged_dynamic_extension import load_packaged_dynamic_paimon
+    from test_vane_wheel_ray_paimon import (
+        RayPaimonHarness,
+        create_two_worker_cluster,
+    )
 finally:
     sys.path.pop(0)
 
@@ -44,88 +48,101 @@ def sql_string(value: object) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def exercise_local_fast_insert(connection: object) -> None:
-    with tempfile.TemporaryDirectory(prefix="vane-paimon-local-insert-") as warehouse_text:
+def exercise_default_ray_insert(connection: object) -> None:
+    with tempfile.TemporaryDirectory(prefix="vane-paimon-smoke-insert-") as warehouse_text:
         warehouse = Path(warehouse_text).resolve()
-        uuidless_target = warehouse / "legacy.db/uuidless_target"
-        shutil.copytree(TABLE_PATH, uuidless_target)
-        connection.execute(f"ATTACH {sql_string(warehouse)} AS local_pm (TYPE paimon)")
-        connection.execute("CREATE SCHEMA local_pm.local_insert")
+        fixture_target = warehouse / "legacy.db/fixture_target"
+        shutil.copytree(TABLE_PATH, fixture_target)
+        connection.execute(f"ATTACH {sql_string(warehouse)} AS pm (TYPE paimon)")
+        connection.execute("CREATE SCHEMA pm.smoke")
         connection.execute(
-            "CREATE TABLE local_pm.local_insert.target "
-            "(id INTEGER, part INTEGER, payload VARCHAR) PARTITIONED BY (part)"
+            "CREATE TABLE pm.smoke.target " "(id INTEGER, part INTEGER, payload VARCHAR) PARTITIONED BY (part)"
         )
         source = connection.sql(
             "SELECT i::INTEGER AS id, (i % 3)::INTEGER AS part, "
-            "('local-' || i::VARCHAR)::VARCHAR AS payload FROM range(0, 12) source(i)"
+            "('smoke-' || i::VARCHAR)::VARCHAR AS payload FROM range(0, 12) source(i)"
         )
-        source.insert_into("local_pm.local_insert.target")
-        connection.execute("INSERT INTO local_pm.local_insert.target (id, payload) " "VALUES (12, 'local-partial')")
+        source.insert_into("pm.smoke.target")
+        connection.execute("INSERT INTO pm.smoke.target (id, payload) " "VALUES (12, 'smoke-partial')")
         source.create(
-            "local_pm.local_insert.ctas_target",
-            properties={"partition.default-name": "local-null"},
+            "pm.smoke.ctas_target",
+            properties={"partition.default-name": "smoke-null"},
             partition_by=["part"],
         )
+        rows = [(i, i % 3, f"smoke-{i}") for i in range(12)]
         require_equal(
-            connection.execute(
-                "SELECT count(*)::BIGINT, sum(id)::BIGINT, count(DISTINCT part)::BIGINT "
-                "FROM local_pm.local_insert.target"
-            ).fetchone(),
-            (13, 78, 3),
-            "local-fast native Paimon INSERT",
+            connection.execute("SELECT id, part, payload FROM pm.smoke.target ORDER BY id").fetchall(),
+            rows + [(12, None, "smoke-partial")],
+            "default Ray Paimon INSERT",
         )
         require_equal(
-            connection.execute(
-                "SELECT count(*)::BIGINT, sum(id)::BIGINT, count(DISTINCT part)::BIGINT "
-                "FROM local_pm.local_insert.ctas_target"
-            ).fetchone(),
-            (12, 66, 3),
-            "local-fast native Paimon CTAS",
+            connection.execute("SELECT id, part, payload FROM pm.smoke.ctas_target ORDER BY id").fetchall(),
+            rows,
+            "default Ray Paimon CTAS",
         )
         require_equal(
-            connection.execute("SELECT id, part, payload FROM local_pm.local_insert.target WHERE id = 12").fetchone(),
-            (12, None, "local-partial"),
-            "local-fast native partial-column Paimon INSERT",
+            connection.execute("SELECT id, part, payload FROM pm.smoke.target WHERE id = 12").fetchone(),
+            (12, None, "smoke-partial"),
+            "default Ray partial-column Paimon INSERT",
         )
-        connection.execute("INSERT INTO local_pm.legacy.uuidless_target VALUES ('local-fast', 9, 90, 99.5)")
+        connection.execute("INSERT INTO pm.legacy.fixture_target VALUES ('appended', 9, 90, 99.5)")
         require_equal(
             connection.execute(
-                "SELECT count(*)::BIGINT, max(f1), max(f2), max(f3) " "FROM local_pm.legacy.uuidless_target"
+                "SELECT count(*)::BIGINT, max(f1), max(f2), max(f3) " "FROM pm.legacy.fixture_target"
             ).fetchone(),
             (10, 9, 90, 99.5),
-            "local-fast native INSERT into a UUID-less Paimon table",
+            "default Ray INSERT into the copied Paimon fixture",
         )
 
 
 def main() -> None:
-    if os.environ.get("VANE_RUNNER") != "local-fast":
-        raise RuntimeError("the wheel integration test requires VANE_RUNNER=local-fast")
+    if "VANE_RUNNER" in os.environ:
+        raise RuntimeError("leave VANE_RUNNER unset to qualify the default Ray runner")
 
+    import ray
     import vane
+    from vane import runners
 
-    connection = vane.connect(
-        ":memory:",
-        config={
-            "autoinstall_known_extensions": "false",
-            "autoload_known_extensions": "false",
-        },
-    )
+    if ray.is_initialized():
+        raise RuntimeError("the wheel smoke test must own its Ray cluster")
+    cluster = create_two_worker_cluster(ray)
+    connection = None
     try:
+        runner = runners.get_or_create_runner()
+        require_equal(getattr(runner, "name", None), "ray", "default Vane runner")
+        connection = vane.connect(
+            ":memory:",
+            config={
+                "autoinstall_known_extensions": "false",
+                "autoload_known_extensions": "false",
+            },
+        )
         load_packaged_dynamic_paimon(connection)
         scan = f"paimon_scan({sql_string(TABLE_PATH)})"
         require_equal(
             connection.execute(f"SELECT count(*)::BIGINT, min(f1), max(f1), round(sum(f3), 1) FROM {scan}").fetchone(),
             (9, 1, 3, 198.9),
-            "local-fast packaged Paimon scan",
+            "default Ray packaged Paimon scan",
         )
         require_equal(
             connection.execute(f"SELECT f0, f3 FROM {scan} WHERE f1 = 2 ORDER BY f2").fetchall(),
             [("David", 21.0), ("Eve", 22.1), ("Frank", 23.2)],
-            "local-fast projection and residual filter",
+            "default Ray projection and residual filter",
         )
-        exercise_local_fast_insert(connection)
+        harness = RayPaimonHarness(vane, connection, runner)
+        exercise_default_ray_insert(connection)
+        if harness.write_dispatch_count < 3 or harness.read_dispatch_count < 4:
+            raise AssertionError("Paimon smoke reads and writes did not reach Ray")
     finally:
-        connection.close()
+        try:
+            if connection is not None:
+                connection.close()
+        finally:
+            try:
+                vane.teardown_runner()
+            finally:
+                ray.shutdown()
+                cluster.shutdown()
 
 
 if __name__ == "__main__":
