@@ -534,7 +534,7 @@ void ConfigurePaimonDistributedScan(TableFunction &function) {
 	TableFunctionDistributedScanCallbacks callbacks;
 	callbacks.protocol_version = PAIMON_DISTRIBUTED_SCAN_PROTOCOL_VERSION;
 	callbacks.split_codec = {PAIMON_DISTRIBUTED_SCAN_SPLIT_CODEC, PAIMON_DISTRIBUTED_SCAN_PROTOCOL_VERSION};
-	callbacks.bind_data_mode = TableFunctionDistributedBindDataMode::REQUIRED;
+	callbacks.bind_data_mode = TableFunctionDistributedBindDataMode::BIND_DATA_REQUIRED;
 	callbacks.plan_splits = PaimonPlanDistributedScanSplits;
 	callbacks.create_worker_bind = PaimonCreateDistributedWorkerBind;
 	callbacks.apply_splits = PaimonApplyDistributedScanSplits;
