@@ -1,5 +1,3 @@
-[Project overview](README.md) · [Vane guide](VANE_README.md)
-
 # DuckDB Paimon Extension 🦆
 
 This extension enables [DuckDB](https://duckdb.org/) to read and query [Apache Paimon](https://paimon.apache.org/) format data directly — no ETL pipelines, no Flink/Spark clusters required. Just open a DuckDB shell and run SQL against your Paimon tables.
@@ -255,10 +253,40 @@ Or build in debug mode:
 GEN=ninja make debug
 ```
 
-### Vane integration
+### Optional Vane Build
 
-See the [Vane guide](VANE_README.md) for provider installation, default-Ray
-execution, distributed write limits, and the Vane build targets.
+The default targets continue to build against the upstream `duckdb/`
+submodule. Vane integration is selected explicitly and does not replace the
+native DuckDB extension build.
+
+`vane-extension-ci-tools/` checks out the exact Vane revision pinned in
+`vane-extension.toml`, builds this extension against Vane's
+`external/duckdb`, and enables `PAIMON_VANE_DISTRIBUTED` through the separate
+`extension_config_vane.cmake` configuration. Vane-only headers and code are
+excluded from the default build.
+
+```shell
+make vane_validate
+make vane_ci VANE_BUILD_JOBS=8
+make vane_wheel VANE_BUILD_JOBS=8
+```
+
+The Vane lane validates packaged native behavior plus distributed Paimon
+scans, `INSERT`, and `CREATE TABLE AS` through a two-worker Ray runtime.
+Distributed writes currently support append-only tables. For CTAS, the
+coordinator creates and validates the empty schema-0 table before workers open
+their path-based writers, so the catalog must resolve the target location
+before table creation.
+
+The distributed write execution contract matches the Iceberg integration:
+workers return strict, attempt-scoped commit fragments and the coordinator
+commits the selected `CommitMessage`s once. A known failure before coordinator
+finalization best-effort aborts only the messages that reached the coordinator;
+CTAS keeps its prepared empty table. Once finalization begins, a failed commit
+has an unknown outcome and the table and artifacts are retained. Files without
+an available `CommitMessage` are left to Paimon's orphan-files garbage
+collection. Retry a failed CTAS only after explicitly dropping or otherwise
+cleaning its retained target.
 
 ### Running the Tests
 
