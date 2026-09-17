@@ -258,9 +258,9 @@ cover scans, snapshots, CTAS, append, partitioning, conflicts, and failure clean
 
 ## Tested examples
 
-All nine Python blocks above were executed sequentially on 2026-09-17 with
-Python 3.12 and `vane-ai==0.2.0.dev663`, built from the Vane `main` head selected
-for this run: `d1460a580455f01485e2e508e05d0049cb18a105`. The Paimon provider
+A temporary local test executed all nine Python blocks above sequentially on
+2026-09-17 with Python 3.12 and `vane-ai==0.2.0.dev663`, built from the Vane
+`main` head selected for this run: `d1460a580455f01485e2e508e05d0049cb18a105`. The Paimon provider
 was rebuilt against that exact revision and installed as a non-editable wheel.
 The runtime's native SourceID was verified as `d8a9d61d59`.
 
@@ -274,17 +274,3 @@ This validates the local provider walkthrough, not cloud storage or a multi-host
 cluster. Matching local wheels were built and installed; the TestPyPI placeholders
 must be replaced with published versions. The alternative static-wheel recipe
 was not run by this walkthrough test.
-
-## Re-run the walkthrough test
-
-With matching provider and Vane wheels installed, run the checked-in test from
-this extension's checkout. Leave `VANE_RUNNER` and `RAY_ADDRESS` unset:
-
-```bash
-python -m pip install pytest
-python -I -m pytest -q -s test/vane/test_vane_readme.py
-```
-
-The test executes the Python blocks from this guide in a fresh temporary
-directory, asserts the default Ray runner, checks the resulting data, and owns
-and cleans up a same-host Ray cluster with two CPU execution nodes.
