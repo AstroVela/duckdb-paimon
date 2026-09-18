@@ -676,7 +676,7 @@ static void ValidateTask(const PaimonDistributedInsertGlobalState &global, const
 static unique_ptr<DistributedWriteGlobalState>
 PaimonDistributedInsertInitializeGlobal(ClientContext &context, const DistributedExtensionWriteInfo &info,
                                         const DistributedWriteTaskContext &task) {
-	if (info.mode != DistributedWriteMode::CALLBACK ||
+	if (info.mode != DistributedWriteMode::CALLBACK_SINK ||
 	    info.fragment_codec.name != PAIMON_DISTRIBUTED_WRITE_FRAGMENT_CODEC ||
 	    info.fragment_codec.version != PAIMON_DISTRIBUTED_WRITE_PROTOCOL_VERSION) {
 		throw InvalidInputException("Distributed Paimon write worker contract does not match its registered protocol");
@@ -933,7 +933,7 @@ static DistributedExtensionWriteCallbacks PaimonDistributedInsertCallbacks() {
 
 static void ValidateResolvedInfo(const DistributedExtensionWriteInfo &info,
                                  const PaimonDistributedInsertTransport &transport) {
-	if (info.mode != DistributedWriteMode::CALLBACK || info.capability.extension_name != "paimon" ||
+	if (info.mode != DistributedWriteMode::CALLBACK_SINK || info.capability.extension_name != "paimon" ||
 	    info.capability.capability.name != WriteOperatorName(transport.write_kind) ||
 	    info.capability.capability.protocol_version != PAIMON_DISTRIBUTED_WRITE_PROTOCOL_VERSION ||
 	    info.fragment_codec.name != PAIMON_DISTRIBUTED_WRITE_FRAGMENT_CODEC ||
@@ -1417,7 +1417,7 @@ void RegisterPaimonDistributedWrites(ExtensionLoader &loader) {
 		DistributedWriteOperatorExtension extension;
 		extension.name = operator_name;
 		extension.protocol_version = PAIMON_DISTRIBUTED_WRITE_PROTOCOL_VERSION;
-		extension.mode = DistributedWriteMode::CALLBACK;
+		extension.mode = DistributedWriteMode::CALLBACK_SINK;
 		extension.fragment_codec = {PAIMON_DISTRIBUTED_WRITE_FRAGMENT_CODEC, PAIMON_DISTRIBUTED_WRITE_PROTOCOL_VERSION};
 		extension.callbacks = PaimonDistributedInsertCallbacks();
 		DistributedWriteOperatorExtension::Register(loader, std::move(extension));
