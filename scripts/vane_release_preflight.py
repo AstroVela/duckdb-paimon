@@ -53,8 +53,15 @@ def source_version(source: Path) -> str:
         if not name.startswith("SETUPTOOLS_SCM_PRETEND_VERSION")
         and name not in {"VANE_VERSION_BRANCH", "GITHUB_REF_NAME", "GITHUB_BASE_REF"}
     }
+    # The verified source owns Vane's version scheme; keep all other imports isolated.
+    version_query = (
+        "import runpy, sys; "
+        "sys.path.insert(0, sys.argv[1]); "
+        "sys.argv = ['setuptools_scm']; "
+        "runpy.run_module('setuptools_scm', run_name='__main__')"
+    )
     return subprocess.check_output(
-        [sys.executable, "-I", "-m", "setuptools_scm"],
+        [sys.executable, "-I", "-c", version_query, str(source.resolve())],
         cwd=source,
         env=environment,
         text=True,
