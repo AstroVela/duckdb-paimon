@@ -1,6 +1,4 @@
-# Preparation pin includes the production public key but is not a Vane release.
-# Update this exact pin by reviewed PR after a non-development Vane release is on
-# PyPI. Until then, the release preflight deliberately fails before signing.
+# Production qualification uses the exact PyPI Vane v0.2.0 runtime wheels.
 schema_version = 2
 name = "paimon"
 extension_config = "extension_config_vane.cmake"
@@ -9,7 +7,8 @@ native_test_selection = "test/sql/paimon_scan.test"
 
 [vane]
 repository = "AstroVela/vane"
-revision = "d1460a580455f01485e2e508e05d0049cb18a105"
+# Vane v0.2.0.
+revision = "79049f382ba6ee79d035c09cc8b5d3538e5bbe6a"
 
 [vcpkg]
 repository = "microsoft/vcpkg"

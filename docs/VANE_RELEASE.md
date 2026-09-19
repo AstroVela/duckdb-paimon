@@ -15,18 +15,18 @@ python -m pip install -r vane-extension-ci-tools/requirements-release.txt "PyYAM
 python -I test/vane/test_vane_provider_release.py
 ```
 
-For a locally assembled TestPyPI candidate set:
+For a locally assembled production candidate set:
 
 ```bash
 python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
-  --manifest vane-extension.toml --extension-root . \
+  --manifest vane-extension-release.toml --extension-root . \
   --vane-source ../vane \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
   --directory build/vane-testpypi-wheel-dist \
-  --vane-version 0.2.0.dev663 \
-  --channel testpypi-dev \
-  --require-publishable-on testpypi
+  --vane-version 0.2.0 \
+  --channel release \
+  --require-publishable-on testpypi --require-publishable-on pypi
 ```
 
 The Vane checkout must already exist at the exact manifest revision. The shared
@@ -52,42 +52,45 @@ explicit official vcpkg revision. Paimon's `vane-extension.toml` keeps the same
 revision as its existing `vcpkg.json`; this update changes the Vane pin without
 changing native dependency versions or development package versioning.
 
-## Production preparation and activation
+## Development and production channels
 
 `VaneExtension.yml` has three explicit operations:
 
 | Operation | Runtime source | Native signing key | Upload destination |
 | --- | --- | --- | --- |
-| `build-only` (default; also push/PR CI) | Existing development source pin | Public CI fixture key | GitHub CI artifacts only |
+| `build-only` (default; also push/PR CI) | Locally built Vane v0.2.0 source pin | Public CI fixture key | GitHub CI artifacts only |
 | `testpypi-dev` | Exact development `vane-ai` wheels from TestPyPI | `astrovela/vane-testpypi` | TestPyPI only |
 | `release` | Exact non-development `vane-ai` wheels from PyPI | `astrovela/vane` | TestPyPI, qualification, approval, then identical files to PyPI |
 
-The development manifest `vane-extension.toml` pins dev663.
-`vane-extension-release.toml` is a separate committed, exact source pin. Its
-initial `033b549afcb498633fd6669b26c054c00363004e` commit contains the production
-public key but **is not a published Vane release**. Consequently `release` fails
-in a read-only preflight job before entering the signing environment or building.
-This preparation does not publish or relabel development wheels as production.
+Both manifests pin Vane v0.2.0 at
+`79049f382ba6ee79d035c09cc8b5d3538e5bbe6a`. Build-only CI enables the public
+CI test key in its locally built runtime and packages a matching runtime/provider
+set. These are test artifacts even though the runtime reports `0.2.0`; do not
+mix them with the PyPI runtime or publish them.
 
-To activate production later:
+Production qualification uses the exact PyPI runtime wheels and production
+signer. The preflight checks the complete runtime matrix and production-key
+ancestry before native builds or signing. Updating the pin does not publish the
+provider or establish production qualification.
 
-1. Publish a canonical non-development Vane runtime, including all CPython
-   3.10–3.14 `manylinux_2_28_x86_64` wheels on PyPI. Its source must descend from
-   the reviewed production-key commit above. A prerelease such as `0.2.0rc1` is
-   allowed; development, local, epoch and non-`X.Y.Z` versions are rejected.
-2. Submit and review a PR updating only the production Vane source pin and its
-   preparation-pin regression assertion. Keep the development manifest unchanged.
-3. Configure the `production-signing` GitHub environment to permit only protected
+Use `build-only` for PRs and `release` for production. With the stable pin,
+`testpypi-dev` deliberately rejects `0.2.0`; a future development publication
+requires a separately reviewed pin to its exact TestPyPI runtime. Ordinary
+TestPyPI dev runtimes trust the dedicated TestPyPI key, not the public CI key.
+
+Before the first production release:
+
+1. Configure the `production-signing` GitHub environment to permit only protected
    `main_vane`, with required reviewers, and store the production private key in
    its `VANE_EXTENSION_SIGNING_PRIVATE_KEY` secret. Do not use the TestPyPI key or
    a repository-wide secret. The expected production public DER SHA-256 is
    `8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb`.
-4. Configure the `pypi` environment with required reviewers, prevent self-review,
+2. Configure the `pypi` environment with required reviewers, prevent self-review,
    and allow only protected `main_vane`. Register `vane-extension-paimon` on PyPI
    with owner `AstroVela`, repository `duckdb-paimon`, workflow `VaneExtension.yml`,
    environment `pypi`. Keep the existing TestPyPI registration and `testpypi`
    environment for staging. Restrict that environment to protected `main_vane` too.
-5. Manually dispatch `VaneExtension.yml` on `main_vane`, operation `release`.
+3. Manually dispatch `VaneExtension.yml` on `main_vane`, operation `release`.
    No provider tag is required or created. Approve signing only after reviewing
    the exact source pin, then approve `pypi` only after qualification succeeds.
 
@@ -137,8 +140,8 @@ development CI, not a production publication or production-native qualification.
 
 ## Default Ray qualification
 
-The development manifest pins Vane `d1460a580455f01485e2e508e05d0049cb18a105` (`0.2.0.dev663`);
-the production preparation manifest also pins `d1460a580455f01485e2e508e05d0049cb18a105`.
+Both manifests pin Vane v0.2.0,
+`79049f382ba6ee79d035c09cc8b5d3538e5bbe6a`.
 The smoke and distributed suites require `VANE_RUNNER` to be absent and verify
 Ray dispatch without a runner selection API. Fixtures and readback use that
 same default runner. A test-owned two-worker cluster controls resources only.
