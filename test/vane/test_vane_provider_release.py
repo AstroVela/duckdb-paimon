@@ -156,12 +156,12 @@ def exercise_integration_pins() -> None:
         raise AssertionError("integration must use the current explicit-vcpkg contract")
     if manifest["vcpkg"]["revision"] != vcpkg["builtin-baseline"]:
         raise AssertionError("native and dynamic Paimon lanes must use the same reviewed vcpkg revision")
-    if manifest["vane"]["revision"] != "d1460a580455f01485e2e508e05d0049cb18a105":
-        raise AssertionError("the development runtime must use the reviewed latest-main pin")
+    if manifest["vane"]["revision"] != "79049f382ba6ee79d035c09cc8b5d3538e5bbe6a":
+        raise AssertionError("the development runtime must use the reviewed Vane v0.2.0 pin")
     with (REPOSITORY_ROOT / "vane-extension-release.toml").open("rb") as source:
         production_manifest = tomllib.load(source)
-    if production_manifest["vane"]["revision"] != "d1460a580455f01485e2e508e05d0049cb18a105":
-        raise AssertionError("production preparation must use the reviewed public-key pin")
+    if production_manifest["vane"]["revision"] != "79049f382ba6ee79d035c09cc8b5d3538e5bbe6a":
+        raise AssertionError("production must use the reviewed Vane v0.2.0 pin")
     production_manifest["vane"]["revision"] = manifest["vane"]["revision"]
     if production_manifest != manifest:
         raise AssertionError("production and development must retain the same native dependency configuration")
