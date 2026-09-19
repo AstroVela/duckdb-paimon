@@ -11,7 +11,7 @@ tool revision. Initialize it and run the lightweight consumer checks with Python
 
 ```bash
 git submodule update --init vane-extension-ci-tools
-python -m pip install -r vane-extension-ci-tools/requirements-release.txt "PyYAML>=6.0.2"
+python -m pip install -r vane-extension-ci-tools/requirements-release.txt "PyYAML>=6.0.2" "setuptools-scm>=9.2.0"
 python -I test/vane/test_vane_provider_release.py
 ```
 

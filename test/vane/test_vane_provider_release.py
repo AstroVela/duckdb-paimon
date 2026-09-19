@@ -369,6 +369,62 @@ def exercise_workflow_contract() -> None:
         raise AssertionError("the complete production index must be verified after publishing")
 
 
+def exercise_source_version_import(preflight: ModuleType) -> None:
+    with tempfile.TemporaryDirectory(prefix="vane-paimon-source-version-") as value:
+        root = Path(value)
+        source = root / "vane"
+        package = source / "vane_packaging"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("")
+        (package / "setuptools_scm_version.py").write_text(
+            "import os, sys\n"
+            "def version_scheme(version):\n"
+            "    assert sys.flags.isolated\n"
+            "    assert not any(k.startswith('SETUPTOOLS_SCM_PRETEND_VERSION') for k in os.environ)\n"
+            "    assert not {'VANE_VERSION_BRANCH', 'GITHUB_REF_NAME', 'GITHUB_BASE_REF'} & os.environ.keys()\n"
+            "    return version.format_with('{tag}')\n"
+        )
+        (source / "pyproject.toml").write_text(
+            '[project]\nname = "vane-ai"\ndynamic = ["version"]\n'
+            '[tool.setuptools_scm]\n'
+            'version_scheme = "vane_packaging.setuptools_scm_version:version_scheme"\n'
+            'local_scheme = "no-local-version"\n'
+        )
+        (source / ".gitignore").write_text("__pycache__/\n")
+        untrusted = root / "untrusted"
+        untrusted.mkdir()
+        (untrusted / "setuptools_scm.py").write_text(
+            "raise RuntimeError('inherited PYTHONPATH must not control version discovery')\n"
+        )
+
+        def git(*arguments: str) -> None:
+            subprocess.run(
+                ["git", "-c", "user.name=Version Test", "-c", "user.email=test@example.invalid", *arguments],
+                cwd=source,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+
+        git("init", "--quiet")
+        git("add", ".")
+        environment = {
+            "SETUPTOOLS_SCM_PRETEND_VERSION": "9.9.9",
+            "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VANE_AI": "9.9.9",
+            "VANE_VERSION_BRANCH": "release/9.9",
+            "GITHUB_REF_NAME": "release/9.9",
+            "GITHUB_BASE_REF": "release/9.9",
+            "PYTHONPATH": str(untrusted),
+        }
+        with mock.patch.dict(os.environ, environment):
+            for version in ("0.2.0", "0.3.0"):
+                git("commit", "--quiet", "--allow-empty", "-m", version)
+                git("tag", f"v{version}")
+                actual = preflight.source_version(source)
+                if actual != version:
+                    raise AssertionError(f"expected source tag {version}, got {actual}")
+
+
 def exercise_preflight(preflight: ModuleType, validator: ModuleType) -> None:
     environment = {
         "GITHUB_EVENT_NAME": "workflow_dispatch",
@@ -793,6 +849,7 @@ def main() -> None:
         exercise_promotion_cli(validator)
         exercise_workflow_contract()
         exercise_preflight(preflight, validator)
+        exercise_source_version_import(preflight)
         exercise_production_signing(builder, signer)
         exercise_runtime_index(preflight, validator)
         exercise_phase_boundaries(builder)
