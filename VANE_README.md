@@ -8,30 +8,24 @@ unset and do not call a runner-selection API.
 
 ## Install a provider package
 
-Install `vane-extension-paimon` together with the exact `vane-ai` version
-required by its package metadata. Use the same matching wheels on the
+Install `vane-extension-paimon` from PyPI together with the exact `vane-ai`
+version required by its package metadata. Use the same matching wheels on the
 application, Ray coordinator, and all workers. Provider versions include an
 artifact identity; their version numbers differ from the base runtime.
 See the [release guide](docs/VANE_RELEASE.md) for the development and production
-channels. The following recipe uses development wheels from TestPyPI; replace
-both placeholders with a published matching pair for your Python version:
+channels.
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 
-PAIMON_VERSION='<provider-version>'
-VANE_VERSION='<matching-vane-version>'
-python -m pip download --no-deps --only-binary=:all: \
-  --index-url https://test.pypi.org/simple/ --dest paimon-wheels \
-  "vane-extension-paimon==$PAIMON_VERSION" "vane-ai==$VANE_VERSION"
-python -m pip install --index-url https://pypi.org/simple/ \
-  ./paimon-wheels/*.whl grpcio
+python -m pip install vane-extension-paimon grpcio
 python -m pip check
 ```
 
-Use a fresh wheel directory for each package pair. Published Linux wheels
+Pin exact versions (for example `"vane-extension-paimon==<version>"`) for
+reproducible deployments. Published Linux wheels
 must match your interpreter and platform. Load the installed provider:
 
 ```python
