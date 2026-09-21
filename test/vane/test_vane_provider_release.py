@@ -554,7 +554,7 @@ def exercise_production_signing(builder: ModuleType, signer: ModuleType) -> None
             archive.writestr("vane_ai-0.2.1.dist-info/METADATA", "Name: vane-ai\nVersion: 0.2.0.dev612\n")
         require_error(builder.QualificationError, lambda: builder._require_production_runtime(mismatch))
         for relative in ("share/arrow/ArrowConfig.cmake", "share/arrowflight/ArrowFlightConfig.cmake"):
-            fixture = directory / "dependencies/x64-linux" / relative
+            fixture = directory / "dependencies/x64-linux-release" / relative
             fixture.parent.mkdir(parents=True, exist_ok=True)
             fixture.touch()
         with mock.patch.dict(os.environ, {"CMAKE_ARGS": "-DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON"}):
