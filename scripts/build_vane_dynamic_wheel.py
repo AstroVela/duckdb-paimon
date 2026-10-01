@@ -475,6 +475,7 @@ def _build_environment(
         f"-DVCPKG_MANIFEST_DIR={extension_root}",
         f"-DVCPKG_INSTALLED_DIR={build_directory / 'vcpkg_installed'}",
         f"-DVCPKG_TARGET_TRIPLET={target_triplet}",
+        f"-DVCPKG_OVERLAY_TRIPLETS={extension_root / 'vcpkg-triplets/vane-self-contained'}",
         f"-DCMAKE_PROJECT_TOP_LEVEL_INCLUDES={prefix_config}",
         *_compiler_launcher_arguments(),
     ]
