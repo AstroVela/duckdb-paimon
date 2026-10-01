@@ -554,7 +554,7 @@ def exercise_production_signing(builder: ModuleType, signer: ModuleType) -> None
             archive.writestr("vane_ai-0.2.1.dist-info/METADATA", "Name: vane-ai\nVersion: 0.2.0.dev612\n")
         require_error(builder.QualificationError, lambda: builder._require_production_runtime(mismatch))
         for relative in ("share/arrow/ArrowConfig.cmake", "share/arrowflight/ArrowFlightConfig.cmake"):
-            fixture = directory / "dependencies/x64-linux" / relative
+            fixture = directory / "dependencies/x64-linux-release" / relative
             fixture.parent.mkdir(parents=True, exist_ok=True)
             fixture.touch()
         with mock.patch.dict(os.environ, {"CMAKE_ARGS": "-DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON"}):
@@ -567,6 +567,17 @@ def exercise_production_signing(builder: ModuleType, signer: ModuleType) -> None
                 signing_cmake_option=None,
             )
         options = shlex.split(environment["CMAKE_ARGS"])
+        static_triplets = REPOSITORY_ROOT / "vcpkg-triplets/vane-self-contained"
+        if f"-DVCPKG_OVERLAY_TRIPLETS={static_triplets}" not in options:
+            raise AssertionError("self-contained providers must select static vcpkg dependencies")
+        triplet_check = directory / "check-triplet.cmake"
+        triplet_check.write_text(
+            f'include("{static_triplets / "x64-linux-release.cmake"}")\n'
+            'if(NOT VCPKG_LIBRARY_LINKAGE STREQUAL "static" OR NOT VCPKG_BUILD_TYPE STREQUAL "release")\n'
+            '  message(FATAL_ERROR "provider dependencies must be static and release-only")\n'
+            'endif()\n'
+        )
+        subprocess.run(["cmake", "-P", str(triplet_check)], check=True, capture_output=True, text=True)
         for option in ("VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY", "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY"):
             if f"-D{option}=OFF" not in options or f"-D{option}=ON" in options:
                 raise AssertionError("production builds must explicitly disable both testing trust roots")
