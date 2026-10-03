@@ -39,7 +39,7 @@ import yaml
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 VANE_VERSION = "0.2.0.dev612"
-PAIMON_VERSION = "0.2.0.0.612.1"
+PAIMON_VERSION = "0.2.0.1.dev612"
 INTERPRETERS = ("cp310", "cp311", "cp312", "cp313", "cp314")
 PLATFORM = "manylinux_2_28_x86_64"
 
@@ -69,14 +69,16 @@ def write_wheel(
     *,
     requirement: str = f"vane-ai==={VANE_VERSION}",
     metadata_name: str = "vane-extension-paimon",
+    vane_version: str = VANE_VERSION,
 ) -> Path:
     distribution = "vane_extension_paimon"
-    filename = f"{distribution}-{PAIMON_VERSION}-{interpreter}-none-{PLATFORM}.whl"
-    metadata_directory = f"{distribution}-{PAIMON_VERSION}.dist-info"
+    version = PAIMON_VERSION.removesuffix(".dev612") if vane_version == "0.2.0" else PAIMON_VERSION
+    filename = f"{distribution}-{version}-{interpreter}-none-{PLATFORM}.whl"
+    metadata_directory = f"{distribution}-{version}.dist-info"
     metadata = (
         "Metadata-Version: 2.4\n"
         f"Name: {metadata_name}\n"
-        f"Version: {PAIMON_VERSION}\n"
+        f"Version: {version}\n"
         f"Requires-Dist: {requirement}\n"
         "\n"
     )
@@ -177,7 +179,10 @@ def exercise_integration_pins() -> None:
 def exercise_promotion_cli(validator: ModuleType) -> None:
     with tempfile.TemporaryDirectory(prefix="vane-paimon-promotion-") as value:
         directory = Path(value)
-        wheels = [write_wheel(directory, interpreter, requirement="vane-ai===0.2.0") for interpreter in INTERPRETERS]
+        wheels = [
+            write_wheel(directory, interpreter, requirement="vane-ai===0.2.0", vane_version="0.2.0")
+            for interpreter in INTERPRETERS
+        ]
         document = {
             "urls": [
                 {
@@ -205,15 +210,18 @@ def exercise_promotion_cli(validator: ModuleType) -> None:
         command = ["verify-promotion", *source_arguments, "--vane-version", "0.2.0", "--attempts", "1"]
         with (
             mock.patch.object(validator, "verify_sources"),
-            mock.patch.object(validator, "_request_json", side_effect=[(200, document), (404, {})]) as request,
+            mock.patch.object(
+                validator, "_request_json", side_effect=[(200, document), (404, {}), (404, {})]
+            ) as request,
             redirect_stdout(io.StringIO()),
         ):
             if validator.main(command) != 0:
                 raise AssertionError("the complete byte-identical Paimon stage must be promotable")
             urls = [call.args[0] for call in request.call_args_list]
             if urls != [
-                f"https://test.pypi.org/pypi/vane-extension-paimon/{PAIMON_VERSION}/json",
-                f"https://pypi.org/pypi/vane-extension-paimon/{PAIMON_VERSION}/json",
+                f"https://test.pypi.org/pypi/vane-extension-paimon/{PAIMON_VERSION.removesuffix('.dev612')}/json",
+                f"https://pypi.org/pypi/vane-extension-paimon/{PAIMON_VERSION.removesuffix('.dev612')}/json",
+                "https://pypi.org/pypi/vane-extension-paimon/json",
             ]:
                 raise AssertionError("promotion must verify fixed TestPyPI and PyPI indexes in order")
         with (
@@ -237,7 +245,7 @@ def exercise_promotion_cli(validator: ModuleType) -> None:
                             "--provider",
                             "paimon",
                             "--version",
-                            PAIMON_VERSION,
+                            PAIMON_VERSION.removesuffix(".dev612"),
                             "--index",
                             index,
                             "--attempts",
@@ -386,7 +394,7 @@ def exercise_source_version_import(preflight: ModuleType) -> None:
         )
         (source / "pyproject.toml").write_text(
             '[project]\nname = "vane-ai"\ndynamic = ["version"]\n'
-            '[tool.setuptools_scm]\n'
+            "[tool.setuptools_scm]\n"
             'version_scheme = "vane_packaging.setuptools_scm_version:version_scheme"\n'
             'local_scheme = "no-local-version"\n'
         )
@@ -575,7 +583,7 @@ def exercise_production_signing(builder: ModuleType, signer: ModuleType) -> None
             f'include("{static_triplets / "x64-linux-release.cmake"}")\n'
             'if(NOT VCPKG_LIBRARY_LINKAGE STREQUAL "static" OR NOT VCPKG_BUILD_TYPE STREQUAL "release")\n'
             '  message(FATAL_ERROR "provider dependencies must be static and release-only")\n'
-            'endif()\n'
+            "endif()\n"
         )
         subprocess.run(["cmake", "-P", str(triplet_check)], check=True, capture_output=True, text=True)
         for option in ("VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY", "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY"):
